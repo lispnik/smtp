@@ -1,0 +1,16 @@
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = Test
+[ca_ext]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+[server_ext]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,DNS:mail.test
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid

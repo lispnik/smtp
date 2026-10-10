@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (Debian 13, SBCL)
+    runs-on: ubuntu-latest
+    container: debian:13
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install SBCL, OpenSSL and tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            sbcl git make ca-certificates openssl libssl-dev
+          sbcl --version
+          openssl version
+
+      - uses: actions/checkout@v4
+
+      - name: Cache ocicl
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/ocicl
+            ~/.local/bin/ocicl
+            ocicl
+          key: ocicl-debian13-${{ hashFiles('ocicl.csv') }}
+
+      - name: Install ocicl
+        run: |
+          if [ ! -x ~/.local/bin/ocicl ]; then
+            # Outside the repo, so it cannot collide with our ocicl/ directory.
+            git clone --depth 1 https://github.com/ocicl/ocicl.git /tmp/ocicl-src
+            (cd /tmp/ocicl-src && sbcl --non-interactive --load setup.lisp)
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch dependencies
+        run: |
+          ocicl setup > ~/.sbclrc
+          # Registry downloads occasionally drop; ocicl install is resumable.
+          for attempt in 1 2 3 4; do
+            ocicl install && exit 0
+            echo "ocicl install failed (attempt $attempt); retrying"
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Test
+        run: make test
