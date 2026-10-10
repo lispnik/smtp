@@ -88,9 +88,9 @@
 (defparameter +base32-alphabet+ "abcdefghijklmnopqrstuvwxyz234567")
 
 (defun random-token (&optional (octets 16))
-  "A random lowercase base32 string carrying OCTETS octets of entropy from
-OpenSSL's CSPRNG."
-  (let ((bytes (cl+ssl:random-bytes octets))
+  "A random lowercase base32 string carrying OCTETS octets of entropy from a
+CSPRNG."
+  (let ((bytes (random-octets octets))
         (bits 0) (nbits 0))
     (with-output-to-string (s)
       (loop for b across bytes

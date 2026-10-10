@@ -11,6 +11,6 @@ subjectKeyIdentifier = hash
 basicConstraints = critical,CA:FALSE
 keyUsage = critical,digitalSignature,keyEncipherment
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:localhost,DNS:mail.test
+subjectAltName = DNS:localhost,DNS:mail.test,IP:127.0.0.1
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid

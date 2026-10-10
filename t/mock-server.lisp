@@ -106,7 +106,7 @@ with the port and the session."
                                (funcall handler session))
                           (ignore-errors (close (session-stream session)))
                           (ignore-errors (usocket:socket-close socket))))))
-                (error (e) (setf (session-error session) e))))
+                (serious-condition (e) (setf (session-error session) e))))
             :name "mock smtp server")))
     (unwind-protect (funcall function port session)
       (bt:join-thread thread)

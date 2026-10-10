@@ -86,8 +86,13 @@
    #:reply-enhanced-status
    #:reply-lines
    #:reply-text
+   ;; TLS backends
+   #:*tls-backend*
+   #:start-tls
+   #:register-tls-backend
    ;; connections
    #:*trace*
+   #:connection-tls-backend
    #:connection
    #:open-connection
    #:close-connection

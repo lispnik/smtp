@@ -15,7 +15,6 @@
 and a line. Credentials are always redacted and message content is never
 logged.")
 
-(defconstant +tls-1.2+ #x0303)
 (defconstant +max-line-length+ 4096
   "The longest reply line accepted. RFC 5321 allows 512 octets; servers exceed
 that in practice, but an unbounded line is a memory-exhaustion vector.")
@@ -29,6 +28,7 @@ that in practice, but an unbounded line is a memory-exhaustion vector.")
           :documentation ":NEW, :OPEN, :BROKEN (unusable after an I/O or
 protocol error) or :CLOSED.")
    (tls :initform nil :accessor connection-tls-p)
+   (tls-backend :initarg :tls-backend :initform nil :accessor connection-tls-backend)
    (greeting :initform nil :accessor connection-greeting)
    (extensions :initform '() :accessor %extensions)
    (esmtp :initform nil :accessor connection-esmtp-p)
@@ -99,7 +99,16 @@ longer known."
                    (lambda (c)
                      (declare (ignore c))
                      (setf (connection-state connection) :broken))))
-    (handler-case (%call-with-deadline timeout fn)
+    (handler-case (%call-with-deadline
+                   timeout
+                   (lambda ()
+                     (handler-bind ((error (lambda (e)
+                                             (when (and (not (typep e 'smtp-error))
+                                                        (tls-condition-p e))
+                                               (error 'smtp-connection-error
+                                                      :message (format nil "TLS error while ~a" operation)
+                                                      :cause e)))))
+                       (funcall fn))))
       #+sbcl
       (sb-sys:deadline-timeout ()
         (error 'smtp-timeout :operation operation :seconds timeout))
@@ -113,9 +122,6 @@ longer known."
                                       :cause e))
       (usocket:socket-condition (e)
         (error 'smtp-connection-error :message (format nil "Socket error while ~a" operation)
-                                      :cause e))
-      (cl+ssl::cl+ssl-error (e)
-        (error 'smtp-connection-error :message (format nil "TLS error while ~a" operation)
                                       :cause e)))))
 
 (defmacro with-io ((connection operation &optional timeout) &body body)
@@ -265,114 +271,30 @@ reply)."
       (error 'smtp-connection-error :message (format nil "Cannot connect to ~a:~d" host port)
                                     :cause e))))
 
-;;; Certificate and hostname verification are done by OpenSSL inside the
-;;; handshake: SSL_VERIFY_PEER checks the chain and X509_VERIFY_PARAM_set1_host
-;;; makes a name mismatch a verification failure. (cl+ssl's own after-the-fact
-;;; hostname check is not used; it calls functions OpenSSL 4 removed.)
-
-(cffi:defcfun ("SSL_CTX_get0_param" %ssl-ctx-get0-param) :pointer
-  (ctx :pointer))
-
-(cffi:defcfun ("X509_VERIFY_PARAM_set1_host" %x509-verify-param-set1-host) :int
-  (param :pointer) (name :string) (namelen :size))
-
-(cffi:defcfun ("X509_VERIFY_PARAM_set_hostflags" %x509-verify-param-set-hostflags) :void
-  (param :pointer) (flags :unsigned-int))
-
-(defconstant +x509-check-flag-no-partial-wildcards+ 4)
-(defconstant +x509-v-ok+ 0)
-(defconstant +x509-v-err-hostname-mismatch+ 62)
-
-(defun %tls-context (connection)
-  (let ((ca-file (%ca-file connection))
-        (verify (%verify connection)))
-    (when (and ca-file (not (probe-file ca-file)))
-      (error 'smtp-tls-error :message (format nil "The CA file ~a does not exist" ca-file)))
-    (let ((ctx (cl+ssl:make-context :min-proto-version +tls-1.2+
-                                    :verify-mode (if verify
-                                                     cl+ssl:+ssl-verify-peer+
-                                                     cl+ssl:+ssl-verify-none+)
-                                    :verify-location (if ca-file (namestring ca-file) :default))))
-      (when verify
-        (let ((param (%ssl-ctx-get0-param ctx)))
-          (%x509-verify-param-set-hostflags param +x509-check-flag-no-partial-wildcards+)
-          (unless (= 1 (%x509-verify-param-set1-host param (%tls-hostname connection) 0))
-            (cl+ssl:ssl-ctx-free ctx)
-            (error 'smtp-tls-error :message "Cannot set the name to verify"))))
-      ctx)))
-
-(defun %handshake-verify-code (e)
-  "The X.509 verification result recorded on a failed handshake, if any."
-  (let ((note (ignore-errors (cl+ssl::ssl-error-ssl-verify-error e))))
-    (and note
-         (let ((colon (position #\: note)))
-           (and colon (parse-integer note :start (1+ colon) :junk-allowed t))))))
-
-(defun %verify-error (e hostname &optional (code (cl+ssl::ssl-error-code e)))
-  (declare (ignore e))
-  (error 'smtp-tls-error
-         :message (if (eql code +x509-v-err-hostname-mismatch+)
-                      (format nil "The server's certificate does not match ~a" hostname)
-                      (format nil "The server's certificate for ~a could not be verified (~(~a~))"
-                              hostname (or (cl+ssl::ssl-verify-error-keyword code) code)))))
-
 (defun %start-tls-session (connection)
-  "Replace the connection's stream with a TLS stream. The server's
-certificate chain and its name are verified unless verification was turned
-off; TLS 1.2 is the minimum version."
-  (let ((verify (%verify connection))
-        (hostname (%tls-hostname connection))
-        (timeout (connection-timeout connection)))
-    (handler-bind ((smtp-connection-error
-                     (lambda (c)
-                       (declare (ignore c))
-                       (setf (connection-state connection) :broken))))
-      (when (and verify (%ip-literal-p hostname))
-        ;; Certificates are matched against DNS names only.
-        (error 'smtp-tls-error
-               :message (format nil "Cannot verify a certificate for the IP address ~a; ~
-                                     pass the server's name as :tls-hostname"
-                                hostname)))
-      (let ((stream
-              (handler-case
-                  (cl+ssl:with-global-context ((%tls-context connection) :auto-free-p t)
-                    (%call-with-deadline
-                     timeout
-                     (lambda ()
-                       (cl+ssl:make-ssl-client-stream
-                        (%stream connection)
-                        ;; For SNI; verification is configured in the context.
-                        :hostname (and (not (%ip-literal-p hostname)) hostname)
-                        :verify nil
-                        :certificate (and (%client-certificate connection)
-                                          (namestring (%client-certificate connection)))
-                        :key (and (%client-key connection)
-                                  (namestring (%client-key connection)))
-                        :password (%client-key-password connection)))))
-                (cl+ssl:ssl-error-verify (e) (%verify-error e hostname))
-                (cl+ssl::ssl-error-ssl (e)
-                  (let ((code (%handshake-verify-code e)))
-                    (if code
-                        (%verify-error e hostname code)
-                        (error 'smtp-tls-error :message "The TLS handshake failed" :cause e))))
-                #+sbcl
-                (sb-sys:deadline-timeout ()
-                  (error 'smtp-timeout :operation "negotiating TLS" :seconds timeout))
-                (smtp-error (e) (error e))
-                (cl+ssl::cl+ssl-error (e)
-                  (error 'smtp-tls-error :message "The TLS handshake failed" :cause e))
-                (stream-error (e)
-                  (error 'smtp-tls-error :message "The connection failed during the TLS handshake"
-                                         :cause e)))))
-        (setf (%stream connection) stream)
-        (when verify
-          ;; Belt and braces: the handshake would have failed otherwise.
-          (let ((result (cl+ssl::ssl-get-verify-result (cl+ssl::ssl-stream-handle stream))))
-            (unless (eql result +x509-v-ok+)
-              (error 'smtp-tls-error
-                     :message (format nil "The server's certificate for ~a could not be verified (~a)"
-                                      hostname result)))))))
-    (setf (connection-tls-p connection) t)))
+  "Replace the connection's stream with a TLS stream from its backend. The
+server's certificate chain and name are verified unless verification was
+turned off."
+  (handler-bind ((smtp-connection-error
+                   (lambda (c)
+                     (declare (ignore c))
+                     (setf (connection-state connection) :broken))))
+    (let ((backend (resolve-tls-backend (connection-tls-backend connection))))
+      (setf (%stream connection)
+            (handler-bind ((error (lambda (e)
+                                    (when (and (not (typep e 'smtp-error)) (tls-condition-p e))
+                                      (error 'smtp-tls-error :message "The TLS handshake failed"
+                                                             :cause e)))))
+              (start-tls backend (%stream connection)
+                         :hostname (%tls-hostname connection)
+                         :verify (%verify connection)
+                         :ca-file (%ca-file connection)
+                         :client-certificate (%client-certificate connection)
+                         :client-key (%client-key connection)
+                         :client-key-password (%client-key-password connection)
+                         :timeout (connection-timeout connection)))
+            (connection-tls-backend connection) backend
+            (connection-tls-p connection) t))))
 
 (defun %parse-extensions (lines)
   (let ((extensions '()))
@@ -436,7 +358,7 @@ off; TLS 1.2 is the minimum version."
                                (verify t) ca-file tls-hostname
                                client-certificate client-key client-key-password
                                local-name (connect-timeout 30) (timeout 300) (data-timeout 600)
-                               allow-insecure-auth (trace *trace*))
+                               allow-insecure-auth (trace *trace*) (tls-backend *tls-backend*))
   "Connect to the SMTP server HOST and return a CONNECTION ready for mail.
 
 TLS is :STARTTLS (the default; port 587; fails if the server does not offer
@@ -456,7 +378,12 @@ ALLOW-INSECURE-AUTH is true.
 CONNECT-TIMEOUT bounds connecting, TIMEOUT every other read or write, and
 DATA-TIMEOUT the wait for the server to accept the message. LOCAL-NAME is
 the name sent with EHLO (default: this host's name, or its address).
-TRACE overrides *TRACE*."
+TRACE overrides *TRACE*. TLS-BACKEND chooses the TLS implementation,
+:OPENSSL or :PURE-TLS (see *TLS-BACKEND*).
+
+An IP address is verified against the certificate's IP address entries;
+pass the server's name as TLS-HOSTNAME when its certificate names it
+instead."
   (check-type host string)
   (check-type tls (member :starttls :implicit :opportunistic :none))
   (let* ((port (or port (ecase tls (:starttls 587) (:implicit 465) ((:opportunistic :none) 25))))
@@ -465,12 +392,15 @@ TRACE overrides *TRACE*."
                                     :host wire-host :port port
                                     :local-name local-name
                                     :timeout timeout :data-timeout data-timeout
-                                    :tls-hostname (if tls-hostname (domain-to-ascii tls-hostname) wire-host)
+                                    :tls-hostname (cond ((null tls-hostname) wire-host)
+                                                        ((%ip-literal-p tls-hostname) tls-hostname)
+                                                        (t (domain-to-ascii tls-hostname)))
                                     :verify verify :ca-file ca-file
                                     :client-certificate client-certificate
                                     :client-key client-key
                                     :client-key-password client-key-password
                                     :allow-insecure-auth allow-insecure-auth
+                                    :tls-backend tls-backend
                                     :trace trace))
          (ok nil))
     (when local-name

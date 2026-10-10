@@ -21,7 +21,10 @@ plaintext unless you ask for it.
 
 - TLS is required: STARTTLS on 587 (refusing servers that don't offer it) or
   implicit TLS on 465. TLS 1.2 minimum.
-- Certificate chain *and* host name are verified by OpenSSL during the
+- Two TLS backends: OpenSSL (through cl+ssl) or
+  [pure-tls](https://github.com/atgreen/pure-tls), a TLS 1.3 implementation
+  in Common Lisp with no foreign libraries.
+- Certificate chain *and* host name (or IP address) are verified during the
   handshake, against the system trust store or a CA file you give.
 - Credentials are never sent over an unencrypted connection unless you pass
   `:allow-insecure-auth t`.
@@ -84,13 +87,45 @@ git clone https://github.com/lispnik/smtp.git
 cd smtp && ocicl install
 ```
 
-The dependencies are alexandria, babel, cffi, usocket, cl+ssl, and ironclad
-for DKIM. OpenSSL 1.1.1 or later is required; 3.x and 4.x work.
+```lisp
+(asdf:load-system "smtp")            ; TLS through OpenSSL
+(asdf:load-system "smtp/pure-tls")   ; or TLS in pure Lisp; either or both
+(asdf:load-system "smtp/dkim")       ; optional
+```
+
+| System | What it adds | Dependencies |
+|---|---|---|
+| `smtp/core` | Everything except TLS (plaintext only) | alexandria, babel, usocket |
+| `smtp` | The OpenSSL backend | cffi, cl+ssl; OpenSSL 1.1.1 or later (3.x and 4.x work) |
+| `smtp/pure-tls` | The pure Lisp backend | pure-tls |
+| `smtp/dkim` | DKIM signing | ironclad |
+
+### TLS backends
+
+With one backend loaded it is used automatically; with both, OpenSSL is the
+default. Choose per connection with `:tls-backend`, or globally:
 
 ```lisp
-(asdf:load-system "smtp")
-(asdf:load-system "smtp/dkim")   ; optional
+(setf smtp:*tls-backend* :pure-tls)   ; or :openssl
 ```
+
+Both verify the certificate chain and the server's name (or IP address,
+against the certificate's IP entries) inside the handshake, and are run
+through the same test suite, including against each other.
+
+| | `:openssl` | `:pure-tls` |
+|---|---|---|
+| Protocol versions | TLS 1.2 and 1.3 | TLS 1.3 only |
+| Foreign code | libssl, libcrypto | none |
+| Trust store | OpenSSL's default paths | macOS Keychain, Windows store, or system bundle |
+| Encrypted client keys | yes | no |
+
+TLS 1.3 is offered by every major provider (Gmail, Microsoft 365, Yahoo,
+iCloud, Fastmail), but an older private server may need the OpenSSL
+backend. With pure-tls, session resumption is turned off: pure-tls caches
+session tickets per host name for the whole process, and a resumed session
+skips certificate verification, so a connection could otherwise inherit one
+made with different trust settings.
 
 ## Usage
 
@@ -149,7 +184,8 @@ octets that would be sent.
 | `:credentials` | — | `make-credentials` result, or its arguments as a plist |
 | `:auth-mechanism` | automatic | `:plain`, `:login`, `:xoauth2`, `:oauthbearer` |
 | `:ca-file` | system store | PEM file of trusted CAs |
-| `:tls-hostname` | the host | Name the certificate must match (needed when connecting by IP) |
+| `:tls-hostname` | the host | Name or IP address the certificate must match |
+| `:tls-backend` | `*tls-backend*` | `:openssl` or `:pure-tls` |
 | `:verify` | `t` | `nil` disables certificate checks — for testing only |
 | `:client-certificate`, `:client-key` | — | PEM files for TLS client authentication |
 | `:local-name` | this host's name | Name sent with EHLO |
@@ -241,6 +277,9 @@ C: [1,234 octets of message data]
   deliveries; the conditions make it straightforward to build that on top.
 - Timeouts rely on SBCL's deadlines; the library is developed and tested on
   SBCL. On other implementations it works but I/O is not time-limited.
+- The test certificates are backdated to 2019 with a hundred-year lifetime:
+  macOS, which pure-tls uses for verification there, rejects newer
+  certificates valid for more than 825 days.
 - Domain names are NFC-normalized and lowercased before Punycode conversion;
   the full IDNA2008/UTS #46 mapping tables are not applied.
 - Connections are not safe to share between threads; use one per thread.
@@ -263,7 +302,8 @@ make test
 ```
 
 The tests run an in-process mock SMTP server (plain, STARTTLS and implicit
-TLS, with its own test CA in `t/fixtures`) through normal and hostile
+TLS, with its own test CA in `t/fixtures`; every TLS test runs with both
+backends) through normal and hostile
 conversations: injection attempts, malformed and oversized replies, stalls,
 dropped connections, rejected recipients, transient and permanent failures.
 Property tests check encodings and rendering against random input. DKIM
