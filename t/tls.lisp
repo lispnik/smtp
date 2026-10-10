@@ -149,3 +149,53 @@
     (is (typep (tls-failure "127.0.0.1" :port port :tls :implicit :ca-file (fixture "other-ca.pem")
                                         :tls-hostname "mail.test" :local-name "client.test" :timeout 5)
                'smtp-tls-error))))
+
+(test pure-tls-leaves-no-session-tickets
+  ;; Control: the mock server does send NewSessionTickets after the handshake.
+  (let ((cache (make-hash-table :test 'equal)))
+    (with-mock-server (port s (standard-server) :implicit-tls t)
+      (let* ((socket (usocket:socket-connect "127.0.0.1" port :element-type '(unsigned-byte 8)))
+             (pure-tls:*session-ticket-cache* cache)
+             (tls (pure-tls:make-tls-client-stream (usocket:socket-stream socket)
+                                                   :hostname "localhost"
+                                                   :context (pure-tls:make-tls-context
+                                                             :ca-file (namestring (fixture "ca.pem"))))))
+        (loop for b = (read-byte tls nil) until (or (null b) (= b 10)))
+        (write-sequence (octets (crlf "QUIT" "")) tls)
+        (force-output tls)
+        (ignore-errors (loop while (read-byte tls nil)))
+        (ignore-errors (close tls))
+        (usocket:socket-close socket)))
+    (is-true (gethash "localhost" cache) "the server should have issued a ticket"))
+  ;; Through smtp, no ticket reaches pure-tls's shared cache.
+  (pure-tls:session-ticket-cache-clear "localhost")
+  (let ((*tls-backend* :pure-tls))
+    (with-mock-server (port s (standard-server) :implicit-tls t)
+      (let ((c (apply #'open-connection "127.0.0.1" :port port :tls :implicit (tls-options))))
+        (send-message c (simple-message))
+        (close-connection c))))
+  (is (null (gethash "localhost" pure-tls:*session-ticket-cache*))))
+
+(def-tls-test bracketed-addresses
+  (with-mock-server (port s (standard-server) :implicit-tls t)
+    (let ((c (open-connection "[127.0.0.1]" :port port :tls :implicit :ca-file (fixture "ca.pem")
+                                            :tls-hostname "[IPv6:127.0.0.1]" :local-name "client.test"
+                                            :timeout 5)))
+      (is (connection-tls-p c))
+      (close-connection c))))
+
+(def-tls-test unusable-ca-file
+  (uiop:with-temporary-file (:pathname path :type "pem" :stream out :direction :output)
+    (write-string "not a certificate" out)
+    (finish-output out)
+    (with-mock-server (port s (standard-server) :implicit-tls t)
+      (let ((e (tls-failure "127.0.0.1" :port port :tls :implicit :ca-file path
+                                        :tls-hostname "localhost" :local-name "client.test" :timeout 5)))
+        (is (typep e 'smtp-tls-error))
+        (is (null (search "server's certificate" (princ-to-string e))))))))
+
+(test unknown-backend-fails-before-connecting
+  ;; Port 1 is never contacted: the backend is checked first.
+  (signals smtp-tls-error (open-connection "127.0.0.1" :port 1 :tls-backend :bogus))
+  (finishes (handler-case (open-connection "127.0.0.1" :port 1 :tls :none :tls-backend :bogus)
+              (smtp-connection-error () t))))

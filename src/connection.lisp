@@ -244,6 +244,15 @@ reply)."
       (and (every (lambda (c) (or (digit-char-p c) (char= c #\.))) host)
            (= 3 (count #\. host)))))
 
+(defun %normalize-host (host)
+  "HOST without the brackets or IPv6: prefix of URL and SMTP address
+literals, so \"[::1]\" and \"[IPv6:::1]\" mean the address ::1."
+  (let* ((h (string-trim " " host))
+         (h (if (and (> (length h) 1) (char= (char h 0) #\[) (char= (char h (1- (length h))) #\]))
+                (subseq h 1 (1- (length h)))
+                h)))
+    (if (string-prefix-p "IPv6:" h) (subseq h 5) h)))
+
 (defun %connect (connection host port timeout)
   (handler-case
       (%call-with-deadline
@@ -274,25 +283,38 @@ reply)."
 (defun %start-tls-session (connection)
   "Replace the connection's stream with a TLS stream from its backend. The
 server's certificate chain and name are verified unless verification was
-turned off."
+turned off. Timeouts and transport errors are translated here for every
+backend; each backend translates its own TLS conditions."
   (handler-bind ((smtp-connection-error
                    (lambda (c)
                      (declare (ignore c))
                      (setf (connection-state connection) :broken))))
-    (let ((backend (resolve-tls-backend (connection-tls-backend connection))))
+    (let ((backend (resolve-tls-backend (connection-tls-backend connection)))
+          (timeout (connection-timeout connection)))
       (setf (%stream connection)
-            (handler-bind ((error (lambda (e)
-                                    (when (and (not (typep e 'smtp-error)) (tls-condition-p e))
-                                      (error 'smtp-tls-error :message "The TLS handshake failed"
-                                                             :cause e)))))
-              (start-tls backend (%stream connection)
-                         :hostname (%tls-hostname connection)
-                         :verify (%verify connection)
-                         :ca-file (%ca-file connection)
-                         :client-certificate (%client-certificate connection)
-                         :client-key (%client-key connection)
-                         :client-key-password (%client-key-password connection)
-                         :timeout (connection-timeout connection)))
+            (handler-case
+                (%call-with-deadline
+                 timeout
+                 (lambda ()
+                   (handler-bind ((error (lambda (e)
+                                           (when (and (not (typep e 'smtp-error)) (tls-condition-p e))
+                                             (error 'smtp-tls-error :message "The TLS handshake failed"
+                                                                    :cause e)))))
+                     (start-tls backend (%stream connection)
+                                :hostname (%tls-hostname connection)
+                                :verify (%verify connection)
+                                :ca-file (%ca-file connection)
+                                :client-certificate (%client-certificate connection)
+                                :client-key (%client-key connection)
+                                :client-key-password (%client-key-password connection)
+                                :timeout timeout))))
+              #+sbcl
+              (sb-sys:deadline-timeout ()
+                (error 'smtp-timeout :operation "negotiating TLS" :seconds timeout))
+              (smtp-error (e) (error e))
+              (stream-error (e)
+                (error 'smtp-tls-error :message "The connection failed during the TLS handshake"
+                                       :cause e)))
             (connection-tls-backend connection) backend
             (connection-tls-p connection) t))))
 
@@ -387,7 +409,12 @@ instead."
   (check-type host string)
   (check-type tls (member :starttls :implicit :opportunistic :none))
   (let* ((port (or port (ecase tls (:starttls 587) (:implicit 465) ((:opportunistic :none) 25))))
+         (host (%normalize-host host))
          (wire-host (if (%ip-literal-p host) host (domain-to-ascii host)))
+         (tls-hostname (and tls-hostname (%normalize-host tls-hostname)))
+         ;; Resolve the backend now, so a missing one is a configuration
+         ;; error rather than a failure in the middle of the conversation.
+         (tls-backend (if (eq tls :none) tls-backend (resolve-tls-backend tls-backend)))
          (connection (make-instance 'connection
                                     :host wire-host :port port
                                     :local-name local-name
