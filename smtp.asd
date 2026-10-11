@@ -17,6 +17,7 @@
                (:file "src/tls")
                (:file "src/util")
                (:file "src/encoding")
+               (:file "src/idna-table")
                (:file "src/idna")
                (:file "src/address")
                (:file "src/mime-types")

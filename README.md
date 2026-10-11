@@ -62,8 +62,9 @@ servers. One connection can send many messages.
   splitting a character; non-ASCII filenames use RFC 2231 in
   Content-Disposition and encoded-words in the Content-Type name (the form
   Thunderbird sends), each given once.
-- Internationalized domain names are converted to Punycode; addresses with
-  non-ASCII local parts are sent with SMTPUTF8 and UTF-8 headers (RFC 6532).
+- Internationalized domain names are converted with UTS #46 and Punycode;
+  addresses with non-ASCII local parts are sent with SMTPUTF8 and UTF-8
+  headers (RFC 6532).
 - Correct RFC 5322 dates, unique Message-IDs, Bcc kept out of the headers,
   threading headers (In-Reply-To, References) and one-click unsubscribe
   (RFC 8058).
@@ -281,8 +282,10 @@ C: [1,234 octets of message data]
 - The test certificates are backdated to 2019 with a hundred-year lifetime:
   macOS, which pure-tls uses for verification there, rejects newer
   certificates valid for more than 825 days.
-- Domain names are NFC-normalized and lowercased before Punycode conversion;
-  the full IDNA2008/UTS #46 mapping tables are not applied.
+- Domain names are converted by UTS #46 (nontransitional, with every check
+  on), using Unicode 15.0 data to match SBCL's; it passes all 6,235 ToASCII
+  cases of the Unicode conformance file. Regenerate src/idna-table.lisp
+  with tools/gen-idna-table.py when SBCL moves to a newer Unicode version.
 - Connections are not safe to share between threads; use one per thread.
 - Not included: CRAM-MD5 and SCRAM (rarely offered for SMTP), S/MIME and
   OpenPGP, encrypted PEM keys for DKIM.
@@ -290,7 +293,7 @@ C: [1,234 octets of message data]
 ## Standards
 
 RFC 5321 (SMTP), 5322 (message format), 2045–2047 and 2231 (MIME), 3492 and
-5890 (IDN), 3207 (STARTTLS), 8314 (implicit TLS), 4954 (AUTH), 4616 (PLAIN),
+5890–5893 (IDN) with Unicode UTS #46, 3207 (STARTTLS), 8314 (implicit TLS), 4954 (AUTH), 4616 (PLAIN),
 7628 (OAUTHBEARER), 1870 (SIZE), 2920 (PIPELINING), 6152 (8BITMIME), 6531 and
 6532 (SMTPUTF8), 3461 (DSN), 3463 (enhanced status codes), 3030 (CHUNKING),
 2392 (Content-ID), 8058 (one-click unsubscribe), 6376 and 8463 (DKIM).

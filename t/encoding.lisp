@@ -194,7 +194,53 @@
   (is (string= "xn--r8jz45g.xn--zckzah" (domain-to-ascii "例え.テスト")))
   (is (string= "xn--r8jz45g.xn--zckzah" (domain-to-ascii "例え。テスト")))
   (is (string= "example.com" (domain-to-ascii "example.com.")))
+  ;; UTS #46 mapping: full-width forms, ignored characters, case folding.
+  (is (string= "example.com" (domain-to-ascii "ＥＸＡＭＰＬＥ．ｃｏｍ")))
+  (is (string= "example.com" (domain-to-ascii (format nil "exam~cple.com" (code-char #xAD)))))
+  (is (string= "xn--fa-hia.de" (domain-to-ascii "Faß.de")))
+  ;; Bidi (RFC 5893) and joiner (RFC 5892) rules.
+  (signals invalid-address (domain-to-ascii (format nil "1~c.example" (code-char #x05D0))))
+  (signals invalid-address (domain-to-ascii (format nil "a~cb.example" (code-char #x200D))))
   (dolist (bad (list "" "a..b" "-a.com" "a-.com" "a_b.com" "a b.com"
                      (format nil "~a.com" (make-string 64 :initial-element #\a))
                      (format nil "~{~a~^.~}" (make-list 60 :initial-element "abcd"))))
     (signals invalid-address (domain-to-ascii bad))))
+
+(defun unescape-idna-test (string)
+  "STRING with IdnaTestV2's \\uXXXX and \\x{X...} escapes replaced."
+  (with-output-to-string (out)
+    (loop with i = 0
+          while (< i (length string))
+          do (let ((next (and (char= (char string i) #\\) (< (1+ i) (length string))
+                              (char string (1+ i)))))
+               (case next
+                 (#\u (write-char (code-char (parse-integer string :start (+ i 2) :end (+ i 6) :radix 16)) out)
+                  (incf i 6))
+                 (#\x (let ((end (position #\} string :start i)))
+                        (write-char (code-char (parse-integer string :start (+ i 3) :end end :radix 16)) out)
+                        (setf i (1+ end))))
+                 (t (write-char (char string i) out)
+                  (incf i)))))))
+
+(test uts46-conformance
+  ;; Every ToASCII case (nontransitional, all checks on) of the Unicode
+  ;; conformance file for the Unicode version of SBCL's character data.
+  (let ((failures '()) (count 0))
+    (with-open-file (in (fixture "IdnaTestV2.txt") :external-format :utf-8)
+      (loop for line = (read-line in nil)
+            while line
+            unless (or (zerop (length line)) (char= (char line 0) #\#))
+              do (destructuring-bind (source to-unicode unicode-status ascii ascii-status &rest rest)
+                     (mapcar (lambda (f) (string-trim " " f)) (uiop:split-string line :separator ";"))
+                   (declare (ignore rest))
+                   (let* ((source (unescape-idna-test source))
+                          (to-unicode (if (string= "" to-unicode) source (unescape-idna-test to-unicode)))
+                          (expected (if (string= "" ascii) to-unicode (unescape-idna-test ascii)))
+                          (status (if (string= "" ascii-status) unicode-status ascii-status))
+                          (error-expected (not (member status '("" "[]") :test #'string=)))
+                          (got (smtp::%uts46-to-ascii source)))
+                     (incf count)
+                     (unless (if error-expected (null got) (equal got expected))
+                       (push (list source status expected got) failures))))))
+    (is (= 6235 count))
+    (is (null failures) "~d failures, first ~s" (length failures) (first failures))))
