@@ -299,6 +299,44 @@ a reply line."
       ;; Retired connections were closed politely.
       (is (every (lambda (s) (sent-commands s "QUIT")) sessions)))))
 
+(test retiring-connections-never-exceed-the-limit
+  ;; A connection still counts until it is closed: retiring one (here after
+  ;; every message) must not let a replacement open alongside it. The server
+  ;; counts a connection gone when it reads QUIT, before it replies.
+  (let ((lock (bt:make-lock)) (active 0) (peak 0))
+    (with-pool-server (port server
+                       (lambda (s index)
+                         (declare (ignore index))
+                         (bt:with-lock-held (lock) (setf peak (max peak (incf active))))
+                         (let ((open t))
+                           (unwind-protect
+                                (progn
+                                  (srv-send s "220 limit.test ESMTP")
+                                  (loop for line = (srv-read-line s :record nil)
+                                        while line
+                                        do (let ((verb (%verb line)))
+                                             (cond ((string= verb "QUIT")
+                                                    (bt:with-lock-held (lock) (decf active))
+                                                    (setf open nil)
+                                                    (srv-send s "221 bye")
+                                                    (return))
+                                                   ((string= verb "DATA")
+                                                    (srv-send s "354 go")
+                                                    (srv-read-data s)
+                                                    (srv-send s "250 queued")
+                                                    ;; Slow to read what comes next, as
+                                                    ;; a busy server is.
+                                                    (sleep 0.05))
+                                                   (t (srv-send s "250 ok"))))))
+                             (when open (bt:with-lock-held (lock) (decf active)))))))
+      (with-pool (pool port :max-connections 2 :max-messages-per-connection 1)
+        (mapc #'bt:join-thread
+              (loop repeat 4
+                    collect (bt:make-thread
+                             (lambda () (dotimes (i 10) (pool-send-message pool (simple-message)))))))
+        (is (= 40 (stat pool :opened)))))
+    (is (<= peak 2) "~d connections were open at once" peak)))
+
 (test idle-timeout-closes-connections
   (with-pool-server (port server (scripted-server))
     (with-pool (pool port :idle-timeout 0.1)

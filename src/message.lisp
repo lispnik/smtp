@@ -27,7 +27,8 @@
 (defun %sanitize-filename (name)
   (let* ((base (subseq name (1+ (or (position-if (lambda (c) (find c "/\\")) name :from-end t)
                                     -1))))
-         (clean (remove-if #'control-char-p base)))
+         ;; Readers drop surrounding spaces, and Windows trailing dots too.
+         (clean (string-right-trim ". " (string-trim '(#\Space #\Tab) (remove-if #'control-char-p base)))))
     (if (zerop (length clean)) "attachment" clean)))
 
 (defun %valid-parameters-p (string)

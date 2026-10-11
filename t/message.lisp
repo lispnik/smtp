@@ -344,3 +344,57 @@ for pol in (policy.default, policy.compat32):
               for name in (append names names)
               do (is (string= name line))))
       (skip "python3 is not installed")))
+
+(test encoded-headers-start-on-the-first-line
+  ;; Folding straight after "Subject:" leaves an empty first line, which
+  ;; Python's email package (among others) reads as a leading space.
+  (dolist (subject (list "ب;ñÆ(fب)йсt8iF本éс🏽™@¡åB"
+                         (concatenate 'string "кé" (make-string 300 :initial-element #\x))
+                         (make-string 40 :initial-element #\日)))
+    (let* ((text (render (simple-message :subject subject :from "Ëva Ünïcødé-Ñame Lönger Thän Usual <eva@example.com>")))
+           (lines (lines-of text)))
+      (dolist (name '("Subject:" "From:"))
+        (let ((line (find name lines :test #'string-prefix-p)))
+          (is (> (length line) (length name)) "~a is empty on its first line" name)
+          (is (<= (length line) 76))))
+      (when (python-available-p)
+        (is (string= subject
+                     (string-right-trim '(#\Newline)
+                                        (uiop:run-program
+                                         (list "python3" "-I" "-c" "import email,sys
+from email import policy
+print(email.message_from_string(sys.stdin.read(), policy=policy.default)['Subject'])")
+                                         :input (make-string-input-stream text)
+                                         :output '(:string :stripped nil) :external-format :utf-8))))))))
+
+(test filenames-are-trimmed
+  (flet ((name (n) (attachment-filename (make-attachment (octets "x") :filename n))))
+    (is (string= "report.pdf" (name "  report.pdf ")))
+    (is (string= "notes" (name "notes. . ")))
+    (is (string= "attachment" (name " . ")))))
+
+(test tabs-in-display-names
+  (is (string= "Ann Lee" (mailbox-display-name (make-mailbox "ann@example.com" (format nil "Ann~cLee" #\Tab)))))
+  (is (string= "Ann Lee" (mailbox-display-name (parse-mailbox (format nil "Ann~cLee~c<ann@example.com>" #\Tab #\Tab)))))
+  (signals invalid-address (make-mailbox "ann@example.com" (format nil "Ann~cLee" #\Bel))))
+
+(test long-words-in-utf8-headers
+  ;; SMTPUTF8 messages carry raw UTF-8 headers, but a word too long to fold
+  ;; is still sent as encoded-words rather than refused.
+  (let* ((word (make-string 400 :initial-element #\日))
+         (text (render (make-message :from (make-mailbox "alice@example.com" word)
+                                     :to "éva@example.org" :subject (format nil "x ~a y" word)
+                                     :text "hi"))))
+    (is (every (lambda (l) (<= (length (octets l)) 998)) (lines-of text)))
+    (is (search "Subject: =?UTF-8?" text))
+    (when (python-available-p)
+      ;; Python's legacy decoder follows RFC 2047 here; its newer parser
+      ;; wrongly keeps the space between adjacent encoded-words in names.
+      (is (search (format nil "~a <alice@example.com>|x ~a y" word word)
+                  (uiop:run-program
+                   (list "python3" "-I" "-c" "import email,sys
+from email.header import decode_header, make_header
+m = email.message_from_bytes(sys.stdin.buffer.read())
+d = lambda h: str(make_header(decode_header(m[h])))
+sys.stdout.buffer.write((d('From') + '|' + d('Subject')).encode())")
+                   :input (make-string-input-stream text) :output :string :external-format :utf-8))))))

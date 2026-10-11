@@ -147,47 +147,51 @@ CONNECTION was idle. Either way it cannot be used."
        (not (%in-transaction connection))
        (not (%readable-p connection))))
 
-(defun %discard (entries)
-  "Close ENTRIES, which no longer count towards their pool's size. Called
-without the lock held."
-  (dolist (entry entries)
-    (close-connection (%pooled-connection entry))))
-
-(defun %release-slot (pool)
+(defun %release-slot (pool &optional (n 1))
   (bt2:with-lock-held ((%pool-lock pool))
-    (decf (%pool-size pool))
-    (bt2:condition-notify (%pool-available pool))))
+    (decf (%pool-size pool) n)
+    (bt2:condition-broadcast (%pool-available pool))))
+
+(defun %retire (pool entries)
+  "Close ENTRIES, then give up their slots. Called without the lock held."
+  (when entries
+    (dolist (entry entries)
+      (close-connection (%pooled-connection entry)))
+    (%release-slot pool (length entries))))
 
 (defun %take (pool fresh deadline)
   "Under the lock, take an idle entry or reserve a slot for a new connection.
-Returns the entry (or NIL to open a new one) and expired entries to close."
-  (let ((stale '()) (lock (%pool-lock pool)))
+Returns the entry, NIL to open a new one, or :RETIRE with idle entries to
+close first. Those keep their slots until they are closed, so the pool never
+has more than MAX-CONNECTIONS connections open, even briefly."
+  (let ((lock (%pool-lock pool)))
     (bt2:with-lock-held (lock)
       (loop
         (when (%pool-closed pool)
-          (return-from %take (values :closed stale)))
-        (let ((now (%now)))
+          (return-from %take :closed))
+        (let ((now (%now)) (stale '()))
           (unless fresh
             (loop for entry = (pop (%pool-idle pool))
                   while entry
                   do (if (%expired-p pool entry now)
-                         (progn (push entry stale) (decf (%pool-size pool)))
-                         (return-from %take (values entry stale)))))
-          (when (and fresh (%pool-idle pool) (>= (%pool-size pool) (%pool-max-connections pool)))
+                         (push entry stale)
+                         (if stale
+                             (progn (push entry (%pool-idle pool)) (return))
+                             (return-from %take entry)))))
+          (when (and fresh (null stale) (%pool-idle pool)
+                     (>= (%pool-size pool) (%pool-max-connections pool)))
             ;; Make room by closing the least recently used idle connection.
             (let ((oldest (car (last (%pool-idle pool)))))
               (setf (%pool-idle pool) (butlast (%pool-idle pool)))
-              (push oldest stale)
-              (decf (%pool-size pool))))
+              (push oldest stale)))
+          (when stale
+            (return-from %take (values :retire stale)))
           (when (< (%pool-size pool) (%pool-max-connections pool))
             (incf (%pool-size pool))
-            (when stale
-              ;; Retiring them may have freed slots for other threads too.
-              (bt2:condition-broadcast (%pool-available pool)))
-            (return-from %take (values nil stale)))
+            (return-from %take nil))
           (let ((remaining (and deadline (- deadline now))))
             (when (and remaining (<= remaining 0))
-              (return-from %take (values :timeout stale)))
+              (return-from %take :timeout))
             (incf (%pool-waiting pool))
             (unwind-protect
                  (bt2:condition-wait (%pool-available pool) lock :timeout remaining)
@@ -222,18 +226,17 @@ idle longer than the pool's CHECK-AFTER."
   (let ((deadline (let ((w (%pool-wait-timeout pool))) (and w (+ (%now) w)))))
     (loop
       (multiple-value-bind (entry stale) (%take pool fresh deadline)
-        (%discard stale)
         (case entry
           (:closed (error 'smtp-pool-closed))
           (:timeout (error 'smtp-pool-timeout :seconds (%pool-wait-timeout pool)))
+          (:retire (%retire pool stale))
           ((nil) (return (%open-entry pool)))
           (t (if (%alive-p pool entry)
                  (progn (setf (%pooled-reused entry) t)
                         (bt2:with-lock-held ((%pool-lock pool))
                           (incf (%pool-reuses pool)))
                         (return entry))
-                 (progn (%discard (list entry))
-                        (%release-slot pool)))))))))
+                 (%retire pool (list entry)))))))))
 
 (defun %checkin (pool entry)
   (let* ((connection (%pooled-connection entry))
@@ -245,12 +248,11 @@ idle longer than the pool's CHECK-AFTER."
     (bt2:with-lock-held ((%pool-lock pool))
       (if (and keep (not (%pool-closed pool))
                (< (length (%pool-idle pool)) (%pool-max-idle pool)))
-          (push entry (%pool-idle pool))
-          (setf keep nil))
-      (unless keep (decf (%pool-size pool)))
-      (bt2:condition-notify (%pool-available pool)))
+          (progn (push entry (%pool-idle pool))
+                 (bt2:condition-notify (%pool-available pool)))
+          (setf keep nil)))
     (unless keep
-      (close-connection connection))))
+      (%retire pool (list entry)))))
 
 (defun %call-with-entry (pool function &key fresh)
   "Call FUNCTION with a checked-out connection and its entry, counting the
@@ -330,7 +332,6 @@ signalled to threads that ask for one, including any waiting."
       (setf (%pool-closed pool) t
             idle (%pool-idle pool)
             (%pool-idle pool) '())
-      (decf (%pool-size pool) (length idle))
       (bt2:condition-broadcast (%pool-available pool)))
-    (%discard idle)
+    (%retire pool idle)
     nil))

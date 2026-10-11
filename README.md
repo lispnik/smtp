@@ -428,6 +428,18 @@ Property tests check encodings and rendering against random input. DKIM
 signatures are verified with the `openssl` command line tool when it is
 installed.
 
+`make stress` runs load and fuzz tests that take several minutes:
+- throughput over one connection and through a pool of 16 threads;
+- thousands of connections, checked for leaked descriptors and memory;
+- 50 MB messages;
+- 1,500 sessions with a randomly misbehaving server, each of which must end
+  in an `smtp-error` within its timeouts;
+- 3,000 random messages, rendered and read back with Python's email package;
+- 200,000 corrupted DNS responses;
+- a delivery queue run from several threads at once.
+
+Pick sections with `STRESS=pool,messages make stress`.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

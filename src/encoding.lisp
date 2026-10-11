@@ -192,9 +192,10 @@ choice produces a 7-bit body, so no server extension is ever needed."
                    ((%q-word-safe-p (code-char o)) (write-char (code-char o) s))
                    (t (format s "=~:@(~2,'0x~)" o))))))
 
-(defun encode-header-words (string &key (encoding :auto))
+(defun encode-header-words (string &key (encoding :auto) (first-limit 75))
   "Encode STRING as a list of RFC 2047 encoded-words in UTF-8, each at most
-75 characters. Multi-octet characters are never split across words.
+75 characters, the first at most FIRST-LIMIT so that it can share a line
+with the header's name. Multi-octet characters are never split across words.
 ENCODING is :B, :Q or :AUTO (Q for mostly-ASCII text)."
   (let* ((encoding (if (eq encoding :auto)
                        (if (> (count-if (lambda (c) (> (char-code c) 127)) string)
@@ -202,7 +203,9 @@ ENCODING is :B, :Q or :AUTO (Q for mostly-ASCII text)."
                            :b :q)
                        encoding))
          (prefix (if (eq encoding :b) "=?UTF-8?B?" "=?UTF-8?Q?"))
-         (budget (- 75 (length prefix) 2))
+         (full (- 75 (length prefix) 2))
+         ;; Room for at least one character of any width (12 for Q).
+         (budget (max 12 (min full (- first-limit (length prefix) 2))))
          (words '())
          (chunk (make-octet-buffer 64)))
     (labels ((encoded (octets)
@@ -213,7 +216,8 @@ ENCODING is :B, :Q or :AUTO (Q for mostly-ASCII text)."
                (when (plusp (length chunk))
                  (push (concatenate 'string prefix (encoded (buffer-octets chunk)) "?=")
                        words)
-                 (setf (fill-pointer chunk) 0))))
+                 (setf (fill-pointer chunk) 0
+                       budget full))))
       (loop for c across string
             for octets = (utf8-octets (string c))
             do (let ((trial (make-octet-buffer)))
@@ -225,17 +229,21 @@ ENCODING is :B, :Q or :AUTO (Q for mostly-ASCII text)."
       (flush))
     (nreverse words)))
 
-(defun needs-encoded-words-p (string)
+(defun %long-word-p (string)
+  "Whether STRING has a word (between spaces or tabs) over 900 octets as
+UTF-8: too long to fold within a 998-octet line."
+  (loop with start = 0
+        for pos = (position-if #'wsp-char-p string :start start)
+        thereis (> (length (utf8-octets (subseq string start pos))) 900)
+        while pos do (setf start (1+ pos))))
+
+(defun needs-encoded-words-p (string &key utf8)
   "True if unstructured header text STRING cannot be sent as is: it has
-non-ASCII characters, something that looks like an encoded-word, or a word
-too long to fold."
-  (or (not (ascii-p string))
+something that looks like an encoded-word, a word too long to fold, or,
+unless UTF8 (RFC 6532) allows them, non-ASCII characters."
+  (or (and (not utf8) (not (ascii-p string)))
       (search "=?" string)
-      (some (lambda (word) (> (length word) 900))
-            (loop with start = 0
-                  for pos = (position #\Space string :start start)
-                  collect (subseq string start pos)
-                  while pos do (setf start (1+ pos))))))
+      (%long-word-p string)))
 
 (defun encode-unstructured (string &key utf8 name)
   "Header text for unstructured STRING (Subject, comments). With UTF8, raw
@@ -245,10 +253,10 @@ error."
   (when (find-if (lambda (c) (and (control-char-p c) (char/= c #\Tab))) string)
     (error 'invalid-header :name name
                            :message "the value contains a line break or control character"))
-  (if (if utf8
-          (needs-encoded-words-p (remove-if-not (lambda (c) (< (char-code c) 128)) string))
-          (needs-encoded-words-p string))
-      (format nil "~{~a~^ ~}" (encode-header-words string))
+  (if (needs-encoded-words-p string :utf8 utf8)
+      (format nil "~{~a~^ ~}" (encode-header-words string
+                                                   ;; After "Name: " on the first line.
+                                                   :first-limit (if name (- 76 (length name) 2) 75)))
       string))
 
 ;;; Header folding (RFC 5322 section 2.2.3)
@@ -292,8 +300,11 @@ VALUE contains a line break."
                        token)))
         (if (and (> (+ (length line) (length piece)) limit)
                  (notevery #'wsp-char-p piece)
-                 ;; The first token may go on its own line when that makes it fit.
-                 (or (not first) (<= (length piece) limit)))
+                 ;; Not straight after the colon: some readers take the
+                 ;; empty first line as a leading space. Only an encoded-word
+                 ;; too long to share the line with a very long name must.
+                 (or (not first)
+                     (and (search "=?" piece) (<= (length piece) limit))))
             (progn (push line lines)
                    (setf line piece))
             (setf line (concatenate 'string line piece)))
@@ -341,7 +352,11 @@ of at most 60 characters that never split a character."
   (cond ((has-line-break-p value)
          (error 'invalid-header :name name :message "parameter value contains a line break"))
         ((and (ascii-p value) (notany #'control-char-p value) (<= (length value) 200))
-         (list (format nil "~a=~a" name (if (%token-p value) value (%quote-string value)))))
+         ;; A bare ' is legal in a token, but readers take it for RFC 2231's
+         ;; charset'language'value syntax.
+         (list (format nil "~a=~a" name (if (and (%token-p value) (not (find #\' value)))
+                                            value
+                                            (%quote-string value)))))
         ((and (ascii-p value) (notany #'control-char-p value))
          ;; RFC 2231 continuations keep long values foldable.
          (loop for start from 0 below (length value) by 60

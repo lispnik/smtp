@@ -6,7 +6,11 @@ SBCL ?= sbcl
 # from other projects on the machine.
 LISP = $(SBCL) --noinform --non-interactive --eval '(asdf:initialize-source-registry (quote (:source-registry (:directory "$(CURDIR)/") (:tree "$(CURDIR)/ocicl/") :ignore-inherited-configuration)))'
 
-.PHONY: test
+.PHONY: test stress
 
 test:
 	$(LISP) --eval '(asdf:test-system :smtp)'
+
+# Load, concurrency and fuzz tests (several minutes; STRESS=section,... to pick).
+stress:
+	$(SBCL) --dynamic-space-size 4096 --noinform --non-interactive --load tools/stress.lisp

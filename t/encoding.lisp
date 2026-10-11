@@ -137,6 +137,8 @@
   (is (equal '("name=report.pdf") (smtp::format-mime-parameter "name" "report.pdf")))
   (is (equal '("name=\"my report.pdf\"") (smtp::format-mime-parameter "name" "my report.pdf")))
   (is (equal '("name=\"a\\\"b\"") (smtp::format-mime-parameter "name" "a\"b")))
+  (is (equal '("filename=\"'\"") (smtp::format-mime-parameter "filename" "'")))
+  (is (equal '("filename=\"it's.txt\"") (smtp::format-mime-parameter "filename" "it's.txt")))
   (is (equal '("filename*=UTF-8''r%C3%A9sum%C3%A9.pdf")
              (smtp::format-mime-parameter "filename" "résumé.pdf")))
   (let ((parts (smtp::format-mime-parameter "filename" (make-string 40 :initial-element #\é))))

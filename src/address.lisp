@@ -25,7 +25,8 @@ address literal such as \"[192.0.2.1]\"."
   (error 'invalid-address :address address :message (apply #'format nil fmt args)))
 
 (defun %check-no-controls (string what)
-  (when (find-if #'control-char-p string)
+  ;; A tab is whitespace (RFC 5322 WSP), not a control character here.
+  (when (find-if (lambda (c) (and (control-char-p c) (char/= c #\Tab))) string)
     (%address-error string "~a contains a control character or line break" what)))
 
 ;;; Local parts
@@ -137,7 +138,7 @@ address literal such as \"[192.0.2.1]\"."
           mailbox)))))
 
 (defun %parse-display-name (raw original)
-  (let ((name (string-trim '(#\Space #\Tab) raw)))
+  (let ((name (substitute #\Space #\Tab (string-trim '(#\Space #\Tab) raw))))
     (cond ((zerop (length name)) nil)
           ((%quoted-p name) (let ((s (%unquote name original)))
                               (if (zerop (length s)) nil s)))
@@ -194,8 +195,9 @@ address."
     (check-type display-name string)
     (%check-no-controls display-name "display name"))
   (%check-no-controls address "address")
-  (%parse-addr-spec (string-trim '(#\Space #\Tab) address) address
-                    (and display-name (plusp (length display-name)) display-name)))
+  (let ((display-name (and display-name (substitute #\Space #\Tab display-name))))
+    (%parse-addr-spec (string-trim '(#\Space #\Tab) address) address
+                      (and display-name (plusp (length display-name)) display-name))))
 
 (defun ensure-mailbox (designator)
   (etypecase designator
@@ -221,8 +223,11 @@ address."
           (%ascii-domain (mailbox-domain mailbox))))
 
 (defun %format-phrase (phrase utf8)
-  (cond ((and (not utf8) (not (ascii-p phrase)))
-         (format nil "~{~a~^ ~}" (encode-header-words phrase)))
+  (cond ((or (and (not utf8) (not (ascii-p phrase)))
+             ;; A word too long to fold cannot be sent raw or quoted.
+             (%long-word-p phrase))
+         ;; Short enough to follow "Reply-To: " on the header's first line.
+         (format nil "~{~a~^ ~}" (encode-header-words phrase :first-limit 64)))
         ((and (not (search "=?" phrase))
               (let ((words (loop with start = 0
                                  for pos = (position #\Space phrase :start start)
