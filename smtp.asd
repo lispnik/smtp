@@ -54,12 +54,27 @@
   :serial t
   :components ((:file "src/dkim")))
 
+(asdf:defsystem #:smtp/delivery
+  :description "Direct delivery to recipients' mail servers: MX lookup, DANE
+(RFC 7672), MTA-STS (RFC 8461) and a retry queue."
+  :author      "Matthew Kennedy"
+  :license     "MIT"
+  :version     "0.2.1"
+  :depends-on  ("smtp/core" "ironclad" "bordeaux-threads")
+  :serial t
+  :components ((:file "src/delivery/package")
+               (:file "src/delivery/dns")
+               (:file "src/delivery/dane")
+               (:file "src/delivery/mta-sts")
+               (:file "src/delivery/deliver")
+               (:file "src/delivery/queue")))
+
 (asdf:defsystem #:smtp/test
   :description "FiveAM tests for smtp, run against an in-process mock server."
   :author      "Matthew Kennedy"
   :license     "MIT"
   :version     "0.2.1"
-  :depends-on  ("smtp" "smtp/pure-tls" "smtp/dkim" "fiveam" "bordeaux-threads")
+  :depends-on  ("smtp" "smtp/pure-tls" "smtp/dkim" "smtp/delivery" "fiveam" "bordeaux-threads")
   :serial t
   :components ((:file "t/package")
                (:file "t/mock-server")
@@ -69,7 +84,8 @@
                (:file "t/reply")
                (:file "t/protocol")
                (:file "t/tls")
-               (:file "t/dkim"))
+               (:file "t/dkim")
+               (:file "t/delivery"))
   :perform (asdf:test-op (o c)
              (unless (uiop:symbol-call :fiveam :run! :smtp)
                (error "smtp tests failed"))))

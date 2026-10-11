@@ -55,6 +55,17 @@ certificate must match HOSTNAME, a DNS name or an IP address literal.
 Failures are signalled as SMTP-TLS-ERROR, or SMTP-TIMEOUT when the
 handshake takes longer than TIMEOUT seconds."))
 
+(defgeneric tls-peer-certificates (backend stream)
+  (:documentation "The certificates the server presented on the TLS STREAM,
+as DER octet vectors, the server's own certificate first."))
+
+(defgeneric tls-verify-chain (backend chain anchor &key hostnames)
+  (:documentation "Verify that CHAIN, DER certificates with the server's
+first, leads to the trust ANCHOR (a DER certificate, trusted whether or not
+it is self-signed), and that the server's certificate is valid now and
+matches one of HOSTNAMES. Used for DANE-TA (RFC 7672). Signals
+SMTP-TLS-ERROR on failure."))
+
 (defun tls-condition-p (condition)
   (some (lambda (type) (typep condition type)) *tls-condition-types*))
 

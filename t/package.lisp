@@ -5,7 +5,8 @@
 ;;; Copyright (C) 2026 Matthew Kennedy
 
 (defpackage #:smtp/test
-  (:use #:cl #:fiveam #:smtp))
+  (:use #:cl #:fiveam #:smtp)
+  (:local-nicknames (#:d #:smtp/delivery)))
 
 (in-package #:smtp/test)
 

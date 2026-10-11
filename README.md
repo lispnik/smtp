@@ -100,6 +100,7 @@ cd smtp && ocicl install
 | `smtp` | The OpenSSL backend | cffi, cl+ssl; OpenSSL 1.1.1 or later (3.x and 4.x work) |
 | `smtp/pure-tls` | The pure Lisp backend | pure-tls |
 | `smtp/dkim` | DKIM signing | ironclad |
+| `smtp/delivery` | Direct delivery: MX, DANE, MTA-STS, retry queue | ironclad, bordeaux-threads |
 
 ### TLS backends
 
@@ -271,11 +272,73 @@ C: MAIL FROM:<alice@example.com> SIZE=1234
 C: [1,234 octets of message data]
 ```
 
+### Delivering without a relay
+
+The `smtp/delivery` system sends straight to each recipient domain's mail
+servers, the way an MTA does, instead of through a submission server:
+
+```lisp
+(asdf:load-system "smtp/delivery")
+
+(smtp/delivery:deliver-message message :local-name "mail.example.com")
+;; => list of RECIPIENT-STATUS: :delivered, :deferred (retry later) or :failed
+```
+
+For each domain the MX hosts are tried in order of preference, with implicit
+MX (the domain itself) and null MX (RFC 7505) handled. Each host gets the
+strongest protection the domain asks for:
+
+| | When | Effect |
+|---|---|---|
+| DANE (RFC 7672) | The MX, address and TLSA records are DNSSEC-validated | TLS required; the certificate must match a TLSA record (DANE-EE or DANE-TA) |
+| MTA-STS (RFC 8461) | The domain publishes an `enforce` policy | Only the policy's MX hosts; TLS 1.2+ with a valid certificate for the MX name |
+| Opportunistic TLS | Otherwise | STARTTLS when offered, without certificate checks (RFC 7435); else plaintext |
+
+DANE is checked first and MTA-STS cannot override a DANE failure. A host
+that fails its checks is skipped, never sent mail, and the recipient is
+deferred if no other host works. `:require-tls t` insists on a verified
+certificate everywhere; `:dane nil` and `:mta-sts nil` turn those off.
+`recipient-status-security` says what each delivery got.
+
+DANE depends on a DNSSEC-validating resolver you trust. DNS answers carry
+the validation result in an unprotected bit, so by default it is believed
+only from a resolver on this host (such as Unbound on 127.0.0.1); with any
+other resolver DANE is not used. To choose:
+
+```lisp
+(setf smtp/delivery:*resolver*
+      (smtp/delivery:make-resolver :nameservers '("127.0.0.1") :trust-ad t))
+```
+
+MTA-STS policies are cached for their `max_age` in `*mta-sts-cache*`;
+specialize `mta-sts-cache-get` and `mta-sts-cache-put` to keep them across
+restarts.
+
+Deferred recipients can be retried with a queue. Run it periodically; it
+retries on a schedule (30 minutes, then 1, 2, 4 and every 8 hours) and gives
+up after five days:
+
+```lisp
+(defvar *queue*
+  (smtp/delivery:make-delivery-queue
+   :local-name "mail.example.com"
+   :on-failed (lambda (item statuses) (send-bounce item statuses))))
+
+(smtp/delivery:enqueue-message *queue* message :dkim signer)
+(smtp/delivery:run-delivery-queue *queue*)   ; e.g. every minute
+```
+
+Sending mail directly needs what any MTA needs to be accepted: a public
+address with outbound port 25 open (many ISPs and clouds block it), a
+`:local-name` matching its reverse DNS, and SPF and DKIM for the sender's
+domain.
+
 ## Scope and limitations
 
-- This is a client for submitting mail to a server (a "submission" client or
-  smarthost relay client). It does not look up MX records or queue and retry
-  deliveries; the conditions make it straightforward to build that on top.
+- The delivery queue is in memory: keep `delivery-queue-messages` somewhere
+  durable if queued mail must survive a restart. Bounces (DSNs) for failed
+  recipients are left to the `:on-failed` callback, and TLSRPT reports
+  (RFC 8460) are not sent.
 - Timeouts rely on SBCL's deadlines; the library is developed and tested on
   SBCL. On other implementations it works but I/O is not time-limited.
 - The test certificates are backdated to 2019 with a hundred-year lifetime:
@@ -293,7 +356,9 @@ RFC 5321 (SMTP), 5322 (message format), 2045–2047 and 2231 (MIME), 3492 and
 5890 (IDN), 3207 (STARTTLS), 8314 (implicit TLS), 4954 (AUTH), 4616 (PLAIN),
 7628 (OAUTHBEARER), 1870 (SIZE), 2920 (PIPELINING), 6152 (8BITMIME), 6531 and
 6532 (SMTPUTF8), 3461 (DSN), 3463 (enhanced status codes), 3030 (CHUNKING),
-2392 (Content-ID), 8058 (one-click unsubscribe), 6376 and 8463 (DKIM).
+2392 (Content-ID), 8058 (one-click unsubscribe), 6376 and 8463 (DKIM),
+1035 and 6840 (DNS), 7505 (null MX), 7672, 7671 and 6698 (DANE), 8461
+(MTA-STS).
 
 ## Development
 

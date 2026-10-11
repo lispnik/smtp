@@ -89,6 +89,8 @@
    ;; TLS backends
    #:*tls-backend*
    #:start-tls
+   #:tls-peer-certificates
+   #:tls-verify-chain
    #:register-tls-backend
    ;; connections
    #:*trace*

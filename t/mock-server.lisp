@@ -74,11 +74,24 @@ the receiving MTA would. Returns octets with CRLF line endings."
     (read-sequence data (session-stream session))
     data))
 
+(defvar *server-certificate* "server.pem"
+  "The fixture the mock server presents: a certificate, or with
+*SERVER-CHAIN* true a file holding the certificate and its issuers.")
+(defvar *server-key* "server-key.pem")
+(defvar *server-chain* nil)
+
 (defun srv-start-tls (session)
   (setf (session-stream session)
-        (cl+ssl:make-ssl-server-stream (session-stream session)
-                                       :certificate (namestring (fixture "server.pem"))
-                                       :key (namestring (fixture "server-key.pem")))
+        (if *server-chain*
+            (cl+ssl:with-global-context
+                ((cl+ssl:make-context :certificate-chain-file (namestring (fixture *server-certificate*))
+                                      :private-key-file (namestring (fixture *server-key*))
+                                      :verify-mode cl+ssl:+ssl-verify-none+)
+                 :auto-free-p t)
+              (cl+ssl:make-ssl-server-stream (session-stream session)))
+            (cl+ssl:make-ssl-server-stream (session-stream session)
+                                           :certificate (namestring (fixture *server-certificate*))
+                                           :key (namestring (fixture *server-key*))))
         (session-tls session) t))
 
 (defun srv-input-pending-p (session)
@@ -91,9 +104,11 @@ with the port and the session."
                                                         :element-type '(unsigned-byte 8)))
          (port (usocket:get-local-port listener))
          (session (make-instance 'session))
+         (certificate *server-certificate*) (key *server-key*) (chain *server-chain*)
          (thread
            (bt:make-thread
             (lambda ()
+              (let ((*server-certificate* certificate) (*server-key* key) (*server-chain* chain))
               (handler-case
                   (sb-sys:with-deadline (:seconds timeout)
                     (when (usocket:wait-for-input listener :timeout timeout :ready-only t)
@@ -106,7 +121,7 @@ with the port and the session."
                                (funcall handler session))
                           (ignore-errors (close (session-stream session)))
                           (ignore-errors (usocket:socket-close socket))))))
-                (serious-condition (e) (setf (session-error session) e))))
+                (serious-condition (e) (setf (session-error session) e)))))
             :name "mock smtp server")))
     (unwind-protect (funcall function port session)
       (bt:join-thread thread)
@@ -140,6 +155,7 @@ with the port and the session."
                           (users '(("alice" . "secret")))
                           (tokens '(("alice" . "good-token")))
                           (reject-recipients '())
+                          (defer-recipients '())
                           (mail-reply "250 2.1.0 OK")
                           (data-reply "250 2.0.0 OK queued as 12345")
                           (ehlo-reply nil))
@@ -236,6 +252,8 @@ authenticate with USERS (passwords) or TOKENS (OAuth)."
                  (cond ((null from) (srv-send s "503 5.5.1 Need MAIL first"))
                        ((member (%path arg) reject-recipients :test #'string-equal)
                         (srv-send s "550 5.1.1 No such user"))
+                       ((member (%path arg) defer-recipients :test #'string-equal)
+                        (srv-send s "450 4.2.1 Try again later"))
                        (t (push (%path arg) rcpts)
                           (srv-send s "250 2.1.5 OK"))))
                 ((string= verb "DATA")
