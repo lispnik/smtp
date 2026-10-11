@@ -186,9 +186,15 @@
 ;;; Deliveries
 
 (defvar *closed-port*
-  ;; A port nothing listens on: connections are refused at once.
-  (let ((l (usocket:socket-listen "127.0.0.1" 0)))
-    (prog1 (usocket:get-local-port l) (usocket:socket-close l))))
+  ;; A server that closes every connection at once. (A port that nothing
+  ;; listens on is not enough: some environments drop such connections
+  ;; silently rather than refusing them, and the port may be reused.)
+  (let ((listener (usocket:socket-listen "127.0.0.1" 0 :reuse-address t
+                                                       :element-type '(unsigned-byte 8))))
+    (bt:make-thread (lambda ()
+                      (loop (ignore-errors (usocket:socket-close (usocket:socket-accept listener)))))
+                    :name "closing server")
+    (usocket:get-local-port listener)))
 
 (defun ports (&rest host-ports)
   (lambda (host address)
@@ -347,7 +353,9 @@
     zone))
 
 (def-tls-test mta-sts-policy-is-fetched-and-cached
-  (let ((cache (make-instance 'd:mta-sts-cache)) (zone (sts-zone)))
+  (let ((cache (make-instance 'd:mta-sts-cache)) (zone (sts-zone))
+        ;; Refreshes after the policy server has gone fail at once.
+        (d::*mta-sts-port* *closed-port*))
     (with-mock-dns (r zone)
       (with-policy-server ()
         (let ((policy (d:mta-sts-policy "example.test" :resolver r :cache cache
@@ -458,7 +466,7 @@
       (let ((statuses (d:deliver-message (simple-message :to '("bob@example.test" "gone@example.test"
                                                                "busy@example.test"))
                                          :resolver r :port (ports :mx1 port) :local-name "client.test"
-                                         :timeout 5 :mta-sts nil)))
+                                         :connect-timeout 5 :timeout 5 :mta-sts nil)))
         (is (eq :delivered (d:recipient-status-status (status-of statuses "bob@example.test"))))
         (is (eq :failed (d:recipient-status-status (status-of statuses "gone@example.test"))))
         (is (= 550 (reply-code (d:recipient-status-reply (status-of statuses "gone@example.test")))))
@@ -480,7 +488,8 @@
       (flet ((status (to)
                (d:recipient-status-status
                 (first (d:deliver-message (simple-message :to to) :resolver r :mta-sts nil
-                                                                  :local-name "client.test")))))
+                                                                  :local-name "client.test"
+                                                                  :connect-timeout 5 :timeout 5)))))
         (is (eq :failed (status "a@nullmx.test")))
         (is (eq :failed (status "a@nowhere.test")))
         (is (eq :deferred (status "a@broken.test")))))))
@@ -586,7 +595,7 @@
                                             :resolver (d:make-resolver :nameservers '("127.0.0.1")
                                                                        :port *closed-port* :timeout 0.2)
                                             :port (lambda (host address) (declare (ignore host address)) port)
-                                            :local-name "client.test" :timeout 5))))
+                                            :local-name "client.test" :connect-timeout 5 :timeout 5))))
       (is (eq :delivered (d:recipient-status-status status)) "~a" (d:recipient-status-message status)))
     (is (equal '("bob@[127.0.0.1]") (second (first (session-messages s)))))))
 
@@ -655,7 +664,8 @@
 (test queue-retries-until-delivered
   (with-mock-dns (r (example-zone))
     (let* ((delivered '()) (deferred 0) (port nil)
-           (queue (d:make-delivery-queue :resolver r :local-name "client.test" :timeout 5 :mta-sts nil
+           (queue (d:make-delivery-queue :resolver r :local-name "client.test" :timeout 5 :connect-timeout 5
+                                         :mta-sts nil
                                          :retry-schedule '(60 120)
                                          :on-delivered (lambda (item statuses)
                                                          (declare (ignore item))
@@ -683,6 +693,7 @@
   (with-mock-dns (r (example-zone))
     (let* ((failed '())
            (queue (d:make-delivery-queue :resolver r :local-name "client.test" :mta-sts nil
+                                         :timeout 5 :connect-timeout 5
                                          :give-up-after 3600 :port #'refused
                                          :on-failed (lambda (item statuses)
                                                       (declare (ignore item))
