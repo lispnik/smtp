@@ -150,6 +150,45 @@ returns a `delivery-result`.
     (smtp:send-message c m)))
 ```
 
+### Connection pools
+
+A pool shares a bounded number of connections to one server between any
+number of threads. Connections are opened when needed and kept for reuse.
+
+```lisp
+(defvar *pool*
+  (smtp:make-connection-pool "smtp.example.com"
+                             :credentials '(:username "alice" :password "secret")
+                             :max-connections 4))
+
+(smtp:pool-send-message *pool* message)   ; from any thread
+
+(smtp:with-pooled-connection (c *pool*)   ; several messages on one connection
+  (dolist (m messages) (smtp:send-message c m)))
+
+(smtp:close-connection-pool *pool*)
+```
+
+`make-connection-pool` takes every option of `open-connection`, plus:
+
+| Option | Default | |
+|---|---|---|
+| `:max-connections` | 4 | Connections open at once |
+| `:max-idle` | `:max-connections` | Unused connections kept open |
+| `:idle-timeout` | 60 | Seconds an unused connection is kept |
+| `:max-messages-per-connection` | 100 | Transactions before a connection is retired |
+| `:max-connection-age` | 600 | Seconds before a connection is retired |
+| `:check-after` | 10 | Idle seconds after which NOOP is sent before reuse |
+| `:wait-timeout` | 30 | Seconds to wait for a free connection, then `smtp-pool-timeout` |
+
+A connection the server has closed or announced it is closing (421) while
+it sat idle is noticed and replaced before use. If a reused connection
+fails before the server accepted `MAIL FROM`, `pool-send-message` sends
+the message once more on a new connection; nothing has been delivered at
+that point, so it cannot arrive twice. Failures after that are signalled as
+usual. A connection left broken or mid-transaction is closed rather than
+returned to the pool. `connection-pool-statistics` reports usage.
+
 ### Building messages
 
 ```lisp
@@ -283,7 +322,8 @@ C: [1,234 octets of message data]
   certificates valid for more than 825 days.
 - Domain names are NFC-normalized and lowercased before Punycode conversion;
   the full IDNA2008/UTS #46 mapping tables are not applied.
-- Connections are not safe to share between threads; use one per thread.
+- A connection is not safe to share between threads; use one per thread, or
+  a connection pool, which is.
 - Not included: CRAM-MD5 and SCRAM (rarely offered for SMTP), S/MIME and
   OpenPGP, encrypted PEM keys for DKIM.
 

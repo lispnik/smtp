@@ -9,7 +9,7 @@
   :author      "Matthew Kennedy"
   :license     "MIT"
   :version     "0.2.1"
-  :depends-on  ("alexandria" "babel" "usocket")
+  :depends-on  ("alexandria" "babel" "usocket" "bordeaux-threads")
   :serial t
   :components ((:file "src/package")
                (:file "src/reply")
@@ -23,7 +23,8 @@
                (:file "src/message")
                (:file "src/connection")
                (:file "src/auth")
-               (:file "src/transaction")))
+               (:file "src/transaction")
+               (:file "src/pool")))
 
 (asdf:defsystem #:smtp
   :description "A modern, secure SMTP client and MIME message builder (TLS via OpenSSL)."
@@ -69,7 +70,8 @@
                (:file "t/reply")
                (:file "t/protocol")
                (:file "t/tls")
-               (:file "t/dkim"))
+               (:file "t/dkim")
+               (:file "t/pool"))
   :perform (asdf:test-op (o c)
              (unless (uiop:symbol-call :fiveam :run! :smtp)
                (error "smtp tests failed"))))
