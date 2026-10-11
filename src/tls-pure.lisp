@@ -92,6 +92,34 @@
       (pure-tls:tls-error (e)
         (error 'smtp-tls-error :message "The TLS handshake failed" :cause e)))))
 
+;;; Certificates for DANE (RFC 7672)
+
+(defmethod tls-peer-certificates ((backend (eql :pure-tls)) stream)
+  (let ((chain (or (pure-tls:tls-peer-certificate-chain stream)
+                   (alexandria:ensure-list (pure-tls:tls-peer-certificate stream)))))
+    (loop for cert in chain
+          for der = (pure-tls::x509-certificate-raw-der cert)
+          when der collect der)))
+
+(defmethod tls-verify-chain ((backend (eql :pure-tls)) chain anchor &key hostnames)
+  (handler-case
+      (let* ((ta (pure-tls:parse-certificate anchor))
+             ;; Up to, not including, the anchor: pure-tls checks the last
+             ;; link against the trusted certificates.
+             (path (loop for der in chain
+                         until (and (not (eq der (first chain))) (equalp der anchor))
+                         collect (pure-tls:parse-certificate der))))
+        (pure-tls::verify-certificate-chain path (list ta) :purpose :server-auth)
+        (unless (some (lambda (name)
+                        (ignore-errors (pure-tls:verify-hostname (first path) name) t))
+                      hostnames)
+          (error 'smtp-tls-error
+                 :message (format nil "The server's certificate does not match ~{~a~^ or ~}" hostnames)))
+        t)
+    (pure-tls:tls-error (e)
+      (error 'smtp-tls-error
+             :message (format nil "The server's certificate does not chain to the DANE trust anchor (~a)" e)))))
+
 (register-tls-backend :pure-tls
                       :condition-types '(pure-tls:tls-error)
                       :random-bytes #'pure-tls:random-bytes)

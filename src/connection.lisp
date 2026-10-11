@@ -302,7 +302,7 @@ backend; each backend translates its own TLS conditions."
                                                                     :cause e)))))
                      (start-tls backend (%stream connection)
                                 :hostname (%tls-hostname connection)
-                                :verify (%verify connection)
+                                :verify (let ((v (%verify connection))) (and v (not (functionp v))))
                                 :ca-file (%ca-file connection)
                                 :client-certificate (%client-certificate connection)
                                 :client-key (%client-key connection)
@@ -316,7 +316,13 @@ backend; each backend translates its own TLS conditions."
                 (error 'smtp-tls-error :message "The connection failed during the TLS handshake"
                                        :cause e)))
             (connection-tls-backend connection) backend
-            (connection-tls-p connection) t))))
+            (connection-tls-p connection) t)
+      (when (functionp (%verify connection))
+        ;; A custom check of the server's certificates, such as DANE.
+        (handler-bind ((error (lambda (e)
+                                (declare (ignore e))
+                                (setf (connection-state connection) :broken))))
+          (funcall (%verify connection) backend (%stream connection)))))))
 
 (defun %parse-extensions (lines)
   (let ((extensions '()))
@@ -389,7 +395,10 @@ otherwise plaintext; port 25) or :NONE (port 25).
 
 Certificates are verified against the system trust store, or CA-FILE, and
 must match TLS-HOSTNAME (default HOST). VERIFY NIL disables verification,
-which should only be done for testing. CLIENT-CERTIFICATE and CLIENT-KEY
+which should only be done for testing. VERIFY may instead be a function of
+the TLS backend and the TLS stream, called after the handshake in place of
+the usual checks; it signals an error to reject the server (DANE uses this).
+TLS-HOSTNAME is still sent as the server name (SNI). CLIENT-CERTIFICATE and CLIENT-KEY
 are PEM files for TLS client authentication.
 
 CREDENTIALS (see MAKE-CREDENTIALS, or a plist of its arguments) authenticate
