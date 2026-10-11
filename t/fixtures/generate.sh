@@ -22,3 +22,17 @@ openssl rsa -in dkim-rsa-pkcs8.pem -traditional -out dkim-rsa-pkcs1.pem
 openssl genpkey -algorithm ED25519 -out dkim-ed25519.pem
 openssl pkey -in dkim-rsa-pkcs8.pem -pubout -out dkim-rsa-pub.pem
 openssl pkey -in dkim-ed25519.pem -pubout -out dkim-ed25519-pub.pem
+# Encrypted copies of the DKIM keys, one per supported format. The password
+# is "dkim-test" except for the AES-128 PKCS #8 key, whose is "pässwörd" (UTF-8).
+P=pass:dkim-test
+openssl pkcs8 -topk8 -in dkim-rsa-pkcs8.pem -v2 aes-256-cbc -v2prf hmacWithSHA256 -passout $P -out dkim-rsa-pkcs8-aes256.pem
+openssl pkcs8 -topk8 -in dkim-rsa-pkcs8.pem -v2 aes-128-cbc -v2prf hmacWithSHA1 -passout 'pass:pässwörd' -out dkim-rsa-pkcs8-aes128-sha1.pem
+openssl pkcs8 -topk8 -in dkim-rsa-pkcs8.pem -v2 aes-192-cbc -v2prf hmacWithSHA512 -passout $P -out dkim-rsa-pkcs8-aes192-sha512.pem
+openssl pkcs8 -topk8 -in dkim-rsa-pkcs8.pem -scrypt -passout $P -out dkim-rsa-pkcs8-scrypt.pem
+openssl pkcs8 -topk8 -in dkim-ed25519.pem -v2 aes-256-cbc -passout $P -out dkim-ed25519-aes256.pem
+openssl pkcs8 -topk8 -in dkim-rsa-pkcs8.pem -v2 des-ede3-cbc -passout $P -out dkim-rsa-pkcs8-des3.pem
+openssl rsa -in dkim-rsa-pkcs1.pem -traditional -aes256 -passout $P -out dkim-rsa-legacy-aes256.pem
+openssl rsa -in dkim-rsa-pkcs1.pem -traditional -aes128 -passout $P -out dkim-rsa-legacy-aes128.pem
+openssl rsa -in dkim-rsa-pkcs1.pem -traditional -des3 -passout $P -out dkim-rsa-legacy-des3.pem
+# An unsupported cipher, for the error message.
+openssl pkcs8 -topk8 -in dkim-rsa-pkcs8.pem -v2 camellia-256-cbc -passout $P -out dkim-rsa-pkcs8-camellia.pem

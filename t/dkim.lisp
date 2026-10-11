@@ -200,3 +200,72 @@
   (signals smtp-error (smtp/dkim:make-dkim-signer :domain "example.com" :selector "s"
                                                   :identity "a;d=evil.com@example.com"
                                                   :private-key (fixture "dkim-ed25519.pem"))))
+
+;;; Encrypted keys (fixtures made by generate.sh)
+
+(defparameter *encrypted-keys*
+  '(("dkim-rsa-pkcs8-aes256.pem" :rsa "dkim-test")
+    ("dkim-rsa-pkcs8-aes128-sha1.pem" :rsa "pässwörd")
+    ("dkim-rsa-pkcs8-aes192-sha512.pem" :rsa "dkim-test")
+    ("dkim-rsa-pkcs8-scrypt.pem" :rsa "dkim-test")
+    ("dkim-rsa-pkcs8-des3.pem" :rsa "dkim-test")
+    ("dkim-ed25519-aes256.pem" :ed25519 "dkim-test")
+    ("dkim-rsa-legacy-aes256.pem" :rsa "dkim-test")
+    ("dkim-rsa-legacy-aes128.pem" :rsa "dkim-test")
+    ("dkim-rsa-legacy-des3.pem" :rsa "dkim-test"))
+  "(file algorithm password): PKCS #8 with PBKDF2 (several hashes) or scrypt,
+and OpenSSL's traditional DEK-Info encryption.")
+
+(defun signature-of (signed)
+  (cdr (assoc "b" (dkim-tags signed) :test #'string=)))
+
+(test encrypted-keys-sign
+  (let ((plain (list :rsa (signature-of (sign-test-message
+                                         (smtp/dkim:make-dkim-signer :domain "example.com" :selector "s"
+                                                                     :private-key (fixture "dkim-rsa-pkcs8.pem"))))
+                     :ed25519 (signature-of (sign-test-message
+                                             (smtp/dkim:make-dkim-signer :domain "example.com" :selector "s"
+                                                                         :private-key (fixture "dkim-ed25519.pem")))))))
+    (loop for (file algorithm password) in *encrypted-keys*
+          do (let* ((signed (sign-test-message
+                             (smtp/dkim:make-dkim-signer :domain "example.com" :selector "s"
+                                                         :private-key (fixture file)
+                                                         ;; A function, called only when needed.
+                                                         :password (lambda () password))))
+                    (tags (dkim-tags signed)))
+               ;; RSA PKCS #1 v1.5 and Ed25519 signatures are deterministic.
+               (is (string= (getf plain algorithm) (signature-of signed)) "~a" file)
+               (when (openssl-available-p)
+                 (is-true (openssl-verifies-p algorithm
+                                              (fixture (if (eq algorithm :rsa) "dkim-rsa-pub.pem" "dkim-ed25519-pub.pem"))
+                                              (signed-data signed tags)
+                                              (base64-decode (cdr (assoc "b" tags :test #'string=))))
+                          "~a" file))))))
+
+(test encrypted-key-passwords
+  (loop for (file) in *encrypted-keys*
+        do (signals smtp/dkim:dkim-key-password-error
+             (smtp/dkim:load-dkim-private-key (fixture file)))
+           (signals smtp/dkim:dkim-key-password-error
+             (smtp/dkim:load-dkim-private-key (fixture file) :password "wrong password")))
+  ;; The password as octets.
+  (is (eq :rsa (first (smtp/dkim:load-dkim-private-key
+                       (fixture "dkim-rsa-pkcs8-aes128-sha1.pem")
+                       :password (babel:string-to-octets "pässwörd" :encoding :utf-8)))))
+  ;; A password for an unencrypted key is ignored, and never asked for.
+  (is (eq :rsa (first (smtp/dkim:load-dkim-private-key
+                       (fixture "dkim-rsa-pkcs8.pem") :password (lambda () (error "not needed")))))))
+
+(test unsupported-key-encryption
+  (let ((e (handler-case (smtp/dkim:load-dkim-private-key (fixture "dkim-rsa-pkcs8-camellia.pem")
+                                                          :password "dkim-test")
+             (smtp/dkim:dkim-key-error (e) e))))
+    (is (typep e 'smtp/dkim:dkim-key-error))
+    (is (not (typep e 'smtp/dkim:dkim-key-password-error)))
+    (is (search "unsupported cipher" (princ-to-string e))))
+  ;; Corrupted ciphertext is a key error, not a raw decoding error.
+  (let ((pem (uiop:read-file-string (fixture "dkim-rsa-legacy-aes256.pem"))))
+    (signals smtp/dkim:dkim-key-error
+      (smtp/dkim:load-dkim-private-key (substitute #\A #\B (substitute #\Q #\M pem :count 3 :from-end t)
+                                                   :count 3 :from-end t)
+                                       :password "dkim-test"))))

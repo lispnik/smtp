@@ -71,7 +71,8 @@ servers. One connection can send many messages.
 
 **DKIM** (the optional `smtp/dkim` system): rsa-sha256 and ed25519-sha256
 (RFC 8463) signing with relaxed or simple canonicalization, oversigning, PEM
-keys (PKCS #1 and PKCS #8), and a helper that prints the DNS record. Signatures
+keys (PKCS #1 and PKCS #8, plain or password-encrypted), and a helper that
+prints the DNS record. Signatures
 are verified in the tests with OpenSSL and have been checked with dkimpy.
 
 **Errors you can act on**: 4xx replies signal `smtp-transient-error` (retry
@@ -254,6 +255,14 @@ Generate a key with `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:204
 or `openssl genpkey -algorithm ED25519`. Ed25519 signatures are small but not
 every verifier supports them yet, so sign with both: `:dkim (list ed rsa)`.
 
+An encrypted key needs `:password`, a string or a function returning one
+(called only when the key is read). PKCS #8 keys encrypted with PBKDF2 or
+scrypt, as `openssl genpkey -aes256` and `openssl pkcs8 -topk8` write them,
+and OpenSSL's traditional `DEK-Info` keys are read, with AES-128/192/256-CBC
+or DES-EDE3-CBC. A missing or wrong password signals
+`smtp/dkim:dkim-key-password-error`; other key problems
+`smtp/dkim:dkim-key-error`.
+
 ### Tracing
 
 ```lisp
@@ -288,7 +297,7 @@ C: [1,234 octets of message data]
   with tools/gen-idna-table.py when SBCL moves to a newer Unicode version.
 - Connections are not safe to share between threads; use one per thread.
 - Not included: CRAM-MD5 and SCRAM (rarely offered for SMTP), S/MIME and
-  OpenPGP, encrypted PEM keys for DKIM.
+  OpenPGP.
 
 ## Standards
 

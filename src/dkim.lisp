@@ -9,6 +9,8 @@
 (defpackage #:smtp/dkim
   (:use #:cl)
   (:export #:dkim-signer
+           #:dkim-key-error
+           #:dkim-key-password-error
            #:make-dkim-signer
            #:dkim-signer-domain
            #:dkim-signer-selector
@@ -24,6 +26,15 @@
 
 ;;; DER, just enough for private keys and public key records
 
+(define-condition dkim-key-error (smtp:smtp-error) ()
+  (:documentation "A DKIM private key cannot be read or used."))
+
+(define-condition dkim-key-password-error (dkim-key-error) ()
+  (:documentation "An encrypted DKIM private key's password is missing or wrong."))
+
+(defun %key-error (format &rest args)
+  (error 'dkim-key-error :message (apply #'format nil format args)))
+
 (defun %der-read (octets start)
   "The tag, content start and content end of the DER element at START."
   (let* ((tag (aref octets start))
@@ -36,7 +47,7 @@
                     (incf pos n)
                     v))))
     (when (> (+ pos len) (length octets))
-      (error 'smtp:smtp-error :message "Truncated DER data in private key"))
+      (%key-error "Truncated DER data in private key"))
     (values tag pos (+ pos len))))
 
 (defun %der-children (octets start end)
@@ -66,23 +77,191 @@
     (when (>= (first bytes) 128) (push 0 bytes))
     (%der 2 bytes)))
 
-(defparameter +oid-rsa+ #(42 134 72 134 247 13 1 1 1))
-(defparameter +oid-ed25519+ #(43 101 112))
-
 ;;; Keys
 
 (defun %pem-decode (text)
+  "The label, DER octets and headers (an alist) of the first PEM block in TEXT."
   (let* ((begin (search "-----BEGIN " text))
          (label-end (and begin (search "-----" text :start2 (+ begin 11))))
          (body-start (and label-end (+ label-end 5)))
          (end (and body-start (search "-----END " text :start2 body-start))))
     (unless end
-      (error 'smtp:smtp-error :message "Not a PEM-encoded key"))
-    (values (subseq text (+ begin 11) label-end)
-            (smtp:base64-decode (subseq text body-start end)))))
+      (%key-error "Not a PEM-encoded key"))
+    (let ((headers '()) (body (make-string-output-stream)))
+      ;; RFC 1421 headers (Proc-Type, DEK-Info) precede the base64 text.
+      (dolist (line (uiop:split-string (subseq text body-start end) :separator '(#\Newline #\Return)))
+        (let ((colon (position #\: line)))
+          (if colon
+              (push (cons (string-trim " " (subseq line 0 colon))
+                          (string-trim " " (subseq line (1+ colon))))
+                    headers)
+              (write-string line body))))
+      (values (subseq text (+ begin 11) label-end)
+              (handler-case (smtp:base64-decode (get-output-stream-string body))
+                (smtp:smtp-error () (%key-error "The PEM key is not valid base64")))
+              (nreverse headers)))))
+
+(defun %oid (dotted)
+  "The DER content octets of the object identifier DOTTED (\"1.2.840...\")."
+  (let* ((arcs (mapcar #'parse-integer (uiop:split-string dotted :separator ".")))
+         (octets (list (+ (* 40 (first arcs)) (second arcs)))))
+    (dolist (arc (cddr arcs))
+      (let ((groups (loop for v = arc then (ash v -7)
+                          collect (logand v 127)
+                          while (> v 127))))
+        (setf octets (append octets
+                             (loop for (g . more) on (reverse groups)
+                                   collect (if more (logior g 128) g))))))
+    (coerce octets '(vector (unsigned-byte 8)))))
+
+(defun %oid-string (octets)
+  (let ((arcs '()) (v 0))
+    (loop for o across octets
+          do (setf v (+ (* v 128) (logand o 127)))
+             (when (< o 128) (push v arcs) (setf v 0)))
+    (setf arcs (nreverse arcs))
+    (format nil "~d.~d~{.~d~}" (min 2 (floor (first arcs) 40))
+            (- (first arcs) (* 40 (min 2 (floor (first arcs) 40)))) (rest arcs))))
+
+(defparameter +oid-rsa+ (%oid "1.2.840.113549.1.1.1"))
+(defparameter +oid-ed25519+ (%oid "1.3.101.112"))
+(defparameter +oid-pbes2+ (%oid "1.2.840.113549.1.5.13"))
+(defparameter +oid-pbkdf2+ (%oid "1.2.840.113549.1.5.12"))
+(defparameter +oid-scrypt+ (%oid "1.3.6.1.4.1.11591.4.11"))
+
+(defparameter *pbkdf2-prfs*
+  (list (cons (%oid "1.2.840.113549.2.7") :sha1)
+        (cons (%oid "1.2.840.113549.2.8") :sha224)
+        (cons (%oid "1.2.840.113549.2.9") :sha256)
+        (cons (%oid "1.2.840.113549.2.10") :sha384)
+        (cons (%oid "1.2.840.113549.2.11") :sha512)))
+
+(defparameter *key-ciphers*
+  ;; (OID PEM-name ironclad-cipher key-length)
+  (list (list (%oid "2.16.840.1.101.3.4.1.2") "AES-128-CBC" :aes 16)
+        (list (%oid "2.16.840.1.101.3.4.1.22") "AES-192-CBC" :aes 24)
+        (list (%oid "2.16.840.1.101.3.4.1.42") "AES-256-CBC" :aes 32)
+        (list (%oid "1.2.840.113549.3.7") "DES-EDE3-CBC" :3des 24))
+  "Ciphers for encrypted keys: those OpenSSL uses for PKCS #8 and
+traditional encrypted keys.")
+
+(defun %password-octets (password)
+  (let ((p (if (functionp password) (funcall password) password)))
+    (typecase p
+      (null (error 'dkim-key-password-error
+                   :message "The private key is encrypted; give its password with :password"))
+      (string (babel:string-to-octets p :encoding :utf-8))
+      ((vector (unsigned-byte 8)) (coerce p '(simple-array (unsigned-byte 8) (*))))
+      (t (%key-error "The private key password must be a string or octet vector")))))
+
+(defun %wrong-password ()
+  (error 'dkim-key-password-error :message "The password for the private key is wrong"))
+
+(defun %decrypt-key (cipher key iv data)
+  "DATA decrypted with CIPHER in CBC mode, unpadded (PKCS #7), and checked to
+be one whole DER structure. A wrong key almost always fails these checks."
+  (let ((block (ironclad:block-length cipher)))
+    (unless (and (plusp (length data)) (zerop (mod (length data) block)) (= (length iv) block))
+      (%key-error "The encrypted private key is malformed"))
+    (let ((out (make-array (length data) :element-type '(unsigned-byte 8))))
+      (ironclad:decrypt (ironclad:make-cipher cipher :key key :mode :cbc :initialization-vector iv)
+                        (coerce data '(simple-array (unsigned-byte 8) (*))) out)
+      (let ((pad (aref out (1- (length out)))))
+        (unless (and (<= 1 pad block)
+                     (loop for i from (- (length out) pad) below (length out)
+                           always (= pad (aref out i))))
+          (%wrong-password))
+        (let ((der (subseq out 0 (- (length out) pad))))
+          (unless (ignore-errors
+                   (multiple-value-bind (tag start end) (%der-read der 0)
+                     (declare (ignore start))
+                     (and (= tag #x30) (= end (length der)))))
+            (%wrong-password))
+          der)))))
+
+(defun %element (der element)
+  "The content octets of ELEMENT, a (tag start end) list."
+  (subseq der (second element) (third element)))
+
+(defun %decrypt-pkcs8 (der password)
+  "The PrivateKeyInfo DER inside the EncryptedPrivateKeyInfo DER (RFC 5958, PBES2 of RFC 8018)."
+  (handler-case
+      (destructuring-bind ((atag as ae) (dtag ds de))
+          (multiple-value-bind (tag start end) (%der-read der 0)
+            (declare (ignore tag))
+            (%der-children der start end))
+        (declare (ignore atag))
+        (unless (= dtag 4) (%key-error "Malformed encrypted private key"))
+        (destructuring-bind (scheme params) (%der-children der as ae)
+          (unless (equalp (%element der scheme) +oid-pbes2+)
+            (%key-error "The private key is encrypted with an unsupported scheme (~a); ~
+                         re-encrypt it with: openssl pkcs8 -topk8 -v2 aes-256-cbc"
+                        (%oid-string (%element der scheme))))
+          (destructuring-bind (kdf enc) (%der-children der (second params) (third params))
+            (destructuring-bind (kdf-oid kdf-params) (%der-children der (second kdf) (third kdf))
+              (destructuring-bind (cipher-oid iv) (%der-children der (second enc) (third enc))
+                (let ((cipher (find (%element der cipher-oid) *key-ciphers* :key #'first :test #'equalp))
+                      (fields (%der-children der (second kdf-params) (third kdf-params))))
+                  (unless cipher
+                    (%key-error "The private key is encrypted with an unsupported cipher (~a); ~
+                                 use AES-128, AES-192 or AES-256 in CBC mode, or DES-EDE3-CBC"
+                                (%oid-string (%element der cipher-oid))))
+                  (flet ((int (e) (%der-integer der (second e) (third e))))
+                    (let* ((password (%password-octets password))
+                           (salt (%element der (first fields)))
+                           (key-length (fourth cipher))
+                           (key (cond ((equalp (%element der kdf-oid) +oid-pbkdf2+)
+                                       (let* ((more (cddr fields))
+                                              (prf-element (find #x30 more :key #'first))
+                                              (prf (if prf-element
+                                                       (cdr (assoc (%element der (first (%der-children der (second prf-element) (third prf-element))))
+                                                                   *pbkdf2-prfs* :test #'equalp))
+                                                       :sha1)))
+                                         (unless prf (%key-error "The private key uses an unsupported PBKDF2 hash"))
+                                         (ironclad:derive-key (ironclad:make-kdf :pbkdf2 :digest prf)
+                                                              password salt (int (second fields)) key-length)))
+                                      ((equalp (%element der kdf-oid) +oid-scrypt+)
+                                       (destructuring-bind (n r p &rest rest) (rest fields)
+                                         (declare (ignore rest))
+                                         (ironclad:derive-key (ironclad:make-kdf :scrypt-kdf :n (int n) :r (int r) :p (int p))
+                                                              password salt 1 key-length)))
+                                      (t (%key-error "The private key uses an unsupported key derivation (~a)"
+                                                     (%oid-string (%element der kdf-oid)))))))
+                      (%decrypt-key (third cipher) key (%element der iv) (subseq der ds de))))))))))
+    ;; Structural surprises in the outer layers: report them as a bad key.
+    ((or type-error program-error) ()
+      (%key-error "Malformed encrypted private key"))))
+
+(defun %evp-bytes-to-key (password salt length)
+  "OpenSSL's EVP_BytesToKey with MD5 and one iteration, for traditional PEM encryption."
+  (let ((out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+        (previous (make-array 0 :element-type '(unsigned-byte 8))))
+    (loop while (< (length out) length)
+          do (setf previous (ironclad:digest-sequence
+                             :md5 (concatenate '(vector (unsigned-byte 8)) previous password salt)))
+             (loop for o across previous do (vector-push-extend o out)))
+    (subseq out 0 length)))
+
+(defun %decrypt-traditional (der headers password)
+  "DER decrypted by the RFC 1421 Proc-Type/DEK-Info headers OpenSSL writes."
+  (let* ((dek (cdr (assoc "DEK-Info" headers :test #'string-equal)))
+         (comma (and dek (position #\, dek)))
+         (name (and comma (string-upcase (subseq dek 0 comma))))
+         (cipher (find name *key-ciphers* :key #'second :test #'equal)))
+    (unless comma (%key-error "The encrypted private key has no valid DEK-Info header"))
+    (unless cipher
+      (%key-error "The private key is encrypted with an unsupported cipher (~a); ~
+                   use AES-128-CBC, AES-192-CBC, AES-256-CBC or DES-EDE3-CBC" name))
+    (let ((iv (handler-case (ironclad:hex-string-to-byte-array (string-trim " " (subseq dek (1+ comma))))
+                (error () (%key-error "The encrypted private key has a malformed IV")))))
+      (when (< (length iv) 8) (%key-error "The encrypted private key has a malformed IV"))
+      (%decrypt-key (third cipher)
+                    (%evp-bytes-to-key (%password-octets password) (subseq iv 0 8) (fourth cipher))
+                    iv der))))
 
 (defun %rsa-key-from-pkcs1 (der start end)
   (let ((fields (%der-children der start end)))
+    (unless (>= (length fields) 4) (%key-error "Malformed RSA private key"))
     (flet ((int (i) (destructuring-bind (tag s e) (nth i fields)
                       (declare (ignore tag))
                       (%der-integer der s e))))
@@ -91,7 +270,7 @@
 (defun %parse-private-key (der)
   "A list (algorithm key n e) for RSA or (algorithm key) for Ed25519."
   (multiple-value-bind (tag start end) (%der-read der 0)
-    (unless (= tag #x30) (error 'smtp:smtp-error :message "Malformed private key"))
+    (unless (= tag #x30) (%key-error "Malformed private key"))
     (let ((fields (%der-children der start end)))
       (if (and (>= (length fields) 3) (= (first (second fields)) #x30))
           ;; PKCS #8 PrivateKeyInfo
@@ -99,7 +278,7 @@
             (declare (ignore vtag vs ve atag ke rest))
             (let* ((alg (first (%der-children der as ae)))
                    (oid (subseq der (second alg) (third alg))))
-              (unless (= ktag 4) (error 'smtp:smtp-error :message "Malformed PKCS #8 key"))
+              (unless (= ktag 4) (%key-error "Malformed PKCS #8 key"))
               (cond ((equalp oid +oid-rsa+)
                      (multiple-value-bind (itag is ie) (%der-read der ks)
                        (declare (ignore itag))
@@ -107,30 +286,35 @@
                     ((equalp oid +oid-ed25519+)
                      (multiple-value-bind (itag is ie) (%der-read der ks)
                        (unless (and (= itag 4) (= (- ie is) 32))
-                         (error 'smtp:smtp-error :message "Malformed Ed25519 key"))
+                         (%key-error "Malformed Ed25519 key"))
                        (let ((seed (subseq der is ie)))
                          (list :ed25519
                                (ironclad:make-private-key
                                 :ed25519 :x seed :y (ironclad:ed25519-public-key seed))))))
-                    (t (error 'smtp:smtp-error
-                              :message "Unsupported key type; use RSA or Ed25519")))))
+                    (t (%key-error "Unsupported key type; use RSA or Ed25519")))))
           ;; PKCS #1 RSAPrivateKey
           (%rsa-key-from-pkcs1 der start end)))))
 
-(defun load-dkim-private-key (source)
+(defun load-dkim-private-key (source &key password)
   "Read a PEM private key (PKCS #1 RSA, or PKCS #8 RSA or Ed25519) from SOURCE,
-a pathname or a string holding the PEM text. Encrypted keys are not
-supported. Returns a list (algorithm key [n e])."
+a pathname or a string holding the PEM text. Encrypted keys need PASSWORD: a
+string (used as UTF-8), an octet vector, or a function returning either,
+called only when the key is encrypted. Both PKCS #8 encryption (PBES2 with
+PBKDF2 or scrypt) and OpenSSL's traditional Proc-Type/DEK-Info encryption
+are read, with AES-128/192/256-CBC or DES-EDE3-CBC. Problems are signalled
+as DKIM-KEY-ERROR, a missing or wrong password as DKIM-KEY-PASSWORD-ERROR.
+Returns a list (algorithm key [n e])."
   (let ((text (if (and (stringp source) (search "-----BEGIN" source))
                   source
-                  (handler-case (uiop:read-file-string source)
+                  (handler-case (uiop:read-file-string source :external-format :latin-1)
                     (file-error (e)
-                      (error 'smtp:smtp-error
-                             :message (format nil "Cannot read the private key ~a: ~a" source e)))))))
-    (multiple-value-bind (label der) (%pem-decode text)
-      (when (search "ENCRYPTED" label)
-        (error 'smtp:smtp-error :message "Encrypted private keys are not supported"))
-      (%parse-private-key der))))
+                      (%key-error "Cannot read the private key ~a: ~a" source e))))))
+    (multiple-value-bind (label der headers) (%pem-decode text)
+      (%parse-private-key
+       (cond ((string= label "ENCRYPTED PRIVATE KEY") (%decrypt-pkcs8 der password))
+             ((search "ENCRYPTED" (or (cdr (assoc "Proc-Type" headers :test #'string-equal)) ""))
+              (%decrypt-traditional der headers password))
+             (t der))))))
 
 ;;; Signers
 
@@ -170,13 +354,14 @@ supported. Returns a list (algorithm key [n e])."
     (error 'smtp:smtp-error :message (format nil "Invalid DKIM ~a ~s" what value)))
   value)
 
-(defun make-dkim-signer (&key domain selector private-key
+(defun make-dkim-signer (&key domain selector private-key password
                            (headers *default-signed-headers*)
                            (oversign *default-oversigned-headers*)
                            (canonicalization '(:relaxed :relaxed))
                            expiration identity)
   "A DKIM signer for DOMAIN (the d= tag) with SELECTOR (s=), signing with
-PRIVATE-KEY: a PEM pathname or string (see LOAD-DKIM-PRIVATE-KEY). RSA keys
+PRIVATE-KEY: a PEM pathname or string, with PASSWORD if it is encrypted
+(see LOAD-DKIM-PRIVATE-KEY). RSA keys
 give rsa-sha256, Ed25519 keys ed25519-sha256 (sign with both to support
 verifiers that lack Ed25519; pass a list of signers to SEND-MESSAGE).
 
@@ -198,7 +383,7 @@ protected against being added. CANONICALIZATION is (header body), each
     (destructuring-bind (header-c body-c) canonicalization
       (check-type header-c (member :relaxed :simple))
       (check-type body-c (member :relaxed :simple))
-      (destructuring-bind (algorithm key &optional n e) (load-dkim-private-key private-key)
+      (destructuring-bind (algorithm key &optional n e) (load-dkim-private-key private-key :password password)
         (when (and (eq algorithm :rsa) (< (integer-length n) 1024))
           (error 'smtp:smtp-error :message "RSA keys for DKIM must have at least 1024 bits (2048 recommended)"))
         (make-instance 'dkim-signer
