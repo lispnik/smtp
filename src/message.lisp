@@ -291,20 +291,28 @@ rendered safely; problems signal MAIL-FORMAT-ERROR."
                :encoding encoding
                :body (lambda (buffer) (text-body-to-buffer string encoding buffer)))))
 
-(defun %filename-params (name)
+;;; A non-ASCII filename is given once in each header, as Thunderbird does:
+;;; RFC 2231 in Content-Disposition, and RFC 2047 encoded-words in the
+;;; Content-Type name for older readers. Readers such as Gmail and Python
+;;; take the first of two filename parameters, so an ASCII fallback beside
+;;; the RFC 2231 value would hide the real name.
+
+(defun %content-type-name (name)
   (if (ascii-p name)
-      (list (cons "filename" name))
-      (list (cons "filename" (ascii-fallback name)) (cons "filename" name))))
+      name
+      (let ((words (format nil "~{~a~^ ~}" (encode-header-words name :encoding :b))))
+        ;; Too long to stay a quoted string; Content-Disposition still names it.
+        (and (<= (length words) 200) words))))
 
 (defun %attachment-part (attachment)
   (let ((name (attachment-filename attachment))
         (type (attachment-content-type attachment)))
     (make-part type
                :params (unless (find #\; type)
-                         (mapcar (lambda (p) (cons "name" (cdr p))) (%filename-params name)))
+                         (list (cons "name" (%content-type-name name))))
                :encoding :base64
                :disposition (if (attachment-inline-p attachment) "inline" "attachment")
-               :disposition-params (%filename-params name)
+               :disposition-params (list (cons "filename" name))
                :content-id (attachment-content-id attachment)
                :body (lambda (buffer)
                        (base64-body-to-buffer (%attachment-octets attachment) buffer)))))

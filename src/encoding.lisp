@@ -365,10 +365,6 @@ of at most 60 characters that never split a character."
                      for i from 0
                      collect (format nil "~a*~d*=~:[~;UTF-8''~]~a" name i (zerop i) seg)))))))
 
-(defun ascii-fallback (string)
-  "STRING with characters outside printable ASCII replaced by underscores."
-  (map 'string (lambda (c) (if (and (< 31 (char-code c) 127)) c #\_)) string))
-
 (defun format-content-header (value parameters)
   "VALUE followed by \"; name=value\" for each (name . value) in PARAMETERS,
 with values encoded by FORMAT-MIME-PARAMETER."

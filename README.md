@@ -59,8 +59,9 @@ servers. One connection can send many messages.
   so every message is 7-bit clean and no line exceeds the limits; long HTML
   lines are fine.
 - Non-ASCII subjects and display names become RFC 2047 encoded-words, never
-  splitting a character; non-ASCII filenames use RFC 2231 with an ASCII
-  fallback.
+  splitting a character; non-ASCII filenames use RFC 2231 in
+  Content-Disposition and encoded-words in the Content-Type name (the form
+  Thunderbird sends), each given once.
 - Internationalized domain names are converted to Punycode; addresses with
   non-ASCII local parts are sent with SMTPUTF8 and UTF-8 headers (RFC 6532).
 - Correct RFC 5322 dates, unique Message-IDs, Bcc kept out of the headers,

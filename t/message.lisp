@@ -165,7 +165,9 @@ end a message that did not end with one."
           (is (equalp data (decoded-body image)))))
       (is (string= "application/pdf" (type-of-entity attachment)))
       (is (search "filename*=UTF-8''r%C3%A9sum%C3%A9.pdf" (header attachment "Content-Disposition")))
-      (is (search "filename=r_sum_.pdf;" (header attachment "Content-Disposition")))
+      ;; One name per header: an ASCII fallback first would be the one shown.
+      (is (null (search "filename=" (header attachment "Content-Disposition"))))
+      (is (search "name=\"=?UTF-8?B?" (header attachment "Content-Type")))
       (is (equalp data (decoded-body attachment))))))
 
 (test attachment-from-file
@@ -299,3 +301,46 @@ end a message that did not end with one."
   (let* ((img (make-attachment (make-array 3 :element-type '(unsigned-byte 8)) :filename "a.png" :inline t))
          (e (parse (simple-message :html "<img src=cid:x>" :attachments (list img)))))
     (is (search "type=\"text/html\"" (header (second (entity-parts e)) "Content-Type")))))
+
+(defun python-available-p ()
+  (ignore-errors (zerop (nth-value 2 (uiop:run-program '("python3" "-c" "import email")
+                                                       :ignore-error-status t)))))
+
+(defun python-filenames (octets)
+  "The attachment filenames Python's email package reads from OCTETS, under
+its default and its legacy (compat32) policies."
+  (uiop:with-temporary-file (:pathname path :type "eml" :element-type '(unsigned-byte 8)
+                             :stream out :direction :output)
+    (write-sequence octets out)
+    (finish-output out)
+    (uiop:split-string
+     (string-right-trim '(#\Newline)
+                        (uiop:run-program
+                         (list "python3" "-I" "-c"
+                               "import email,sys
+from email import policy
+for pol in (policy.default, policy.compat32):
+    m = email.message_from_binary_file(open(sys.argv[1], 'rb'), policy=pol)
+    for p in m.walk():
+        if p.get_filename():
+            print(p.get_filename())"
+                               (namestring path))
+                         :output '(:string :stripped nil) :external-format :utf-8))
+     :separator '(#\Newline))))
+
+(test python-reads-attachment-names
+  ;; Gmail and Python showed the ASCII fallback, not the real name, when both
+  ;; were given.
+  (if (python-available-p)
+      (let* ((names '("résumé.pdf" "日本語のファイル名.txt" "plain name.txt"))
+             (lines (python-filenames
+                     (render-message
+                      (simple-message :attachments
+                                      (loop for n in names
+                                            collect (make-attachment (octets "x") :filename n
+                                                                     :content-type "text/plain")))))))
+        (is (= 6 (length lines)))
+        (loop for line in lines
+              for name in (append names names)
+              do (is (string= name line))))
+      (skip "python3 is not installed")))

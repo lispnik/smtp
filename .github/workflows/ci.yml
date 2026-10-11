@@ -20,7 +20,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            sbcl git make ca-certificates openssl libssl-dev
+            sbcl git make ca-certificates openssl libssl-dev python3
           sbcl --version
           openssl version
 

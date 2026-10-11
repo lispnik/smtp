@@ -8,7 +8,7 @@
   :description "The smtp client without a TLS backend; load smtp or smtp/pure-tls instead."
   :author      "Matthew Kennedy"
   :license     "MIT"
-  :version     "0.2.0"
+  :version     "0.2.1"
   :depends-on  ("alexandria" "babel" "usocket")
   :serial t
   :components ((:file "src/package")
@@ -29,7 +29,7 @@
   :description "A modern, secure SMTP client and MIME message builder (TLS via OpenSSL)."
   :author      "Matthew Kennedy"
   :license     "MIT"
-  :version     "0.2.0"
+  :version     "0.2.1"
   :homepage    "https://github.com/lispnik/smtp"
   :source-control (:git "https://github.com/lispnik/smtp.git")
   :bug-tracker "https://github.com/lispnik/smtp/issues"
@@ -41,7 +41,7 @@
   :description "The smtp client with TLS 1.3 from pure-tls: no foreign libraries."
   :author      "Matthew Kennedy"
   :license     "MIT"
-  :version     "0.2.0"
+  :version     "0.2.1"
   :depends-on  ("smtp/core" "pure-tls")
   :components ((:file "src/tls-pure")))
 
@@ -49,7 +49,7 @@
   :description "DKIM (RFC 6376, RFC 8463) signing for smtp messages."
   :author      "Matthew Kennedy"
   :license     "MIT"
-  :version     "0.2.0"
+  :version     "0.2.1"
   :depends-on  ("smtp/core" "ironclad")
   :serial t
   :components ((:file "src/dkim")))
@@ -58,7 +58,7 @@
   :description "FiveAM tests for smtp, run against an in-process mock server."
   :author      "Matthew Kennedy"
   :license     "MIT"
-  :version     "0.2.0"
+  :version     "0.2.1"
   :depends-on  ("smtp" "smtp/pure-tls" "smtp/dkim" "fiveam" "bordeaux-threads")
   :serial t
   :components ((:file "t/package")
