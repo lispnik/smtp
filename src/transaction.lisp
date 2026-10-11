@@ -19,6 +19,11 @@ final reply and the message's Message-ID."
   reply
   message-id)
 
+;;; Called with the connection each time the server accepts MAIL FROM, so a
+;;; connection pool can count transactions and know when a failure came
+;;; before any message data was sent.
+(defvar *mail-accepted-hook* nil)
+
 (defgeneric sign-message-octets (signer octets)
   (:documentation "Return OCTETS, a rendered message, signed by SIGNER. The
 smtp/dkim system defines a method for DKIM signers."))
@@ -229,6 +234,7 @@ or SMTP-PERMANENT-ERROR; the connection stays usable for another message."
            (let* ((replies (%send-envelope connection commands))
                   (accepted '())
                   (rejected '()))
+             (when *mail-accepted-hook* (funcall *mail-accepted-hook* connection))
              (loop for rcpt in rcpts
                    for reply in (rest replies)
                    do (if (= (reply-class reply) 2)

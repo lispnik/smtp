@@ -118,4 +118,13 @@
    #:delivery-result-reply
    #:delivery-result-message-id
    ;; message signing hook (see smtp/dkim)
-   #:sign-message-octets))
+   #:sign-message-octets
+   ;; connection pools
+   #:connection-pool
+   #:make-connection-pool
+   #:close-connection-pool
+   #:with-pooled-connection
+   #:pool-send-message
+   #:connection-pool-statistics
+   #:smtp-pool-timeout
+   #:smtp-pool-closed))
