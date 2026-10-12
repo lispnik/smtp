@@ -441,30 +441,41 @@ installed.
 Pick sections with `STRESS=pool,messages make stress`.
 
 `make integration` tests against real servers running in Docker:
-[Mailpit](https://mailpit.axllent.org/) and Postfix, which relays everything
-it accepts to Mailpit. Each message is sent, then read back through Mailpit's
-API and compared with what was sent. The tests cover:
-- every route: plaintext, STARTTLS and implicit TLS, with both TLS backends,
-  with and without authentication;
+- [Mailpit](https://mailpit.axllent.org/), which keeps what it receives;
+- Postfix, which relays everything it accepts to Mailpit;
+- [Stalwart](https://stalw.art/), which delivers to local mailboxes and
+  checks DKIM and DMARC against keys served by a small CoreDNS server.
+
+Each message is sent, read back through Mailpit's API or Stalwart's JMAP,
+and compared with what was sent. Mailpit (Go) and Stalwart (Rust) parse
+messages with their own libraries, so each is an independent check. The
+tests cover:
+- every route to each server: plaintext, STARTTLS and implicit TLS, with
+  both TLS backends, with and without authentication;
 - Unicode headers, bodies and addresses (SMTPUTF8), attachments, HTML with
   inline images, dot-stuffing, long lines, Bcc and an 8 MB message;
-- Postfix's behaviour: BDAT and DATA, rejected recipients, relaying rules,
-  bad passwords, the SIZE limit, delivery status notifications, certificate
-  checks and a connection pool.
+- DKIM: RSA and Ed25519 signatures, every canonicalization, over DATA and
+  BDAT, for an internationalized domain, and a wrong key that must fail;
+- each server's rules: BDAT and DATA, rejected recipients, relaying, bad
+  passwords, refusing to send credentials without TLS, sending only as
+  your own address, the SIZE limit, delivery status notifications,
+  certificate checks and a connection pool.
 
-The first run builds the Postfix image; after that a run takes about 15
-seconds. The servers keep running between runs; `make integration-down`
-stops them, and Mailpit's web page at <http://localhost:18025> shows what
-the tests sent. Without make, as on Windows:
+The first run builds the Postfix and Stalwart images; after that a run takes
+under a minute. The servers keep running between runs; `make
+integration-down` stops them, and Mailpit's web page at
+<http://localhost:18025> shows what was sent to Mailpit and Postfix. Without
+make, as on Windows:
 
 ```sh
 docker compose -f integration/compose.yaml up -d --build --wait
 sbcl --eval '(asdf:test-system :smtp/integration)' --quit
 ```
 
-The ports, all on localhost, are 11025 and 18025 for Mailpit and 10025,
-10587 and 10465 for Postfix; `SMTP_IT_HOST` and the other variables in
-`integration/package.lisp` point the tests elsewhere.
+All ports are on localhost: 11025 and 18025 for Mailpit; 10025, 10587 and
+10465 for Postfix; 12025, 12587, 12465 and 18080 (JMAP) for Stalwart. The
+servers share the Docker subnet 172.29.53.0/24. `SMTP_IT_HOST` and the
+other variables in `integration/package.lisp` point the tests elsewhere.
 
 ## License
 

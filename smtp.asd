@@ -94,15 +94,17 @@
                (error "smtp tests failed"))))
 
 (asdf:defsystem #:smtp/integration
-  :description "Tests of smtp against real servers (Mailpit, Postfix) run in
+  :description "Tests of smtp against real servers (Mailpit, Postfix, Stalwart) run in
 Docker; see integration/compose.yaml and make integration."
   :author      "Matthew Kennedy"
   :license     "MIT"
   :version     "0.3.0"
-  :depends-on  ("smtp" "smtp/pure-tls" "fiveam" "bordeaux-threads" "usocket" "com.inuoe.jzon")
+  :depends-on  ("smtp" "smtp/pure-tls" "smtp/dkim" "fiveam" "bordeaux-threads" "usocket"
+               "alexandria" "cl-base64" "com.inuoe.jzon")
   :serial t
   :components ((:file "integration/package")
                (:file "integration/mailpit")
+               (:file "integration/stalwart")
                (:file "integration/tests"))
   :perform (asdf:test-op (o c)
              (unless (uiop:symbol-call :smtp/integration :run-tests)

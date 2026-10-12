@@ -1,7 +1,8 @@
 # Real SMTP servers for the integration tests (make integration).
 #   docker compose -f integration/compose.yaml up -d --build --wait
 # Ports are published on localhost only. Mailpit's web UI, at
-# http://localhost:18025, shows everything the tests sent.
+# http://localhost:18025, shows everything the tests sent to Mailpit and
+# Postfix; Stalwart keeps its mail in local mailboxes, read over JMAP.
 name: smtp-integration
 
 services:
@@ -31,3 +32,36 @@ services:
       - "127.0.0.1:10025:25"
       - "127.0.0.1:10587:587"
       - "127.0.0.1:10465:465"
+
+  # DKIM keys for Stalwart to verify against; see dns/.
+  dns:
+    image: coredns/coredns:1.14.7
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./dns:/etc/coredns:ro
+    networks:
+      default:
+        ipv4_address: 172.29.53.53
+
+  stalwart:
+    build: ./stalwart
+    hostname: stalwart.example.test
+    depends_on:
+      - dns
+    volumes:
+      - ./certs:/certs:ro
+    # Fresh storage for every container, so setup.sh configures each one.
+    tmpfs:
+      - /var/lib/stalwart:uid=2000,gid=2000,mode=0755
+    ports:
+      - "127.0.0.1:12025:25"
+      - "127.0.0.1:12587:587"
+      - "127.0.0.1:12465:465"
+      - "127.0.0.1:18080:8080"
+
+# A fixed subnet, so Stalwart can be pointed at the dns service's address.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.53.0/24

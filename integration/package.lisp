@@ -43,3 +43,27 @@
     (error "Mailpit's API is not answering at ~a:~d; start the servers with make integration-up"
            *host* *mailpit-api-port*))
   (fiveam:run! :smtp/integration))
+
+;;; The ports and account of the Stalwart service; see integration/stalwart.
+(defparameter *stalwart-smtp-port* (env-port "SMTP_IT_STALWART_SMTP" 12025))
+(defparameter *stalwart-submission-port* (env-port "SMTP_IT_STALWART_SUBMISSION" 12587))
+(defparameter *stalwart-smtps-port* (env-port "SMTP_IT_STALWART_SMTPS" 12465))
+(defparameter *stalwart-http-port* (env-port "SMTP_IT_STALWART_HTTP" 18080))
+;;; Every Stalwart account has this password (its policy rejects short ones).
+;;; Stalwart lets an account send only as its own address, so the tests log
+;;; in as alice, the sender of their messages.
+(defparameter *stalwart-password* "smtp integration tests only 7Kq")
+(defparameter *stalwart-credentials* (list :username "alice@example.test" :password *stalwart-password*))
+
+;;; A received message as a server parsed it, whichever server it was.
+(defstruct received
+  subject
+  from          ; (name . address), name "" when absent
+  to            ; list of (name . address)
+  bcc           ; addresses, when the server reports them (Mailpit)
+  text
+  html
+  attachments   ; list of (filename content-type octets), inline parts included
+  return-path   ; "<address>", or NIL when the server adds none
+  raw           ; the message as stored, octets
+  (headers '())) ; alist of (name . values), for the headers the tests look at

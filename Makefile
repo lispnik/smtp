@@ -15,8 +15,8 @@ test:
 stress:
 	$(SBCL) --dynamic-space-size 4096 --noinform --non-interactive --load tools/stress.lisp
 
-# Tests against real servers (Mailpit, Postfix) in Docker. The servers are
-# left running for the next run; make integration-down stops them.
+# Tests against real servers (Mailpit, Postfix, Stalwart) in Docker. The
+# servers are left running for the next run; make integration-down stops them.
 COMPOSE = docker compose -f integration/compose.yaml
 
 integration: integration-up integration-run

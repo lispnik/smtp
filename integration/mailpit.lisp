@@ -10,18 +10,25 @@
 
 (in-package #:smtp/integration)
 
-(defun http (method path)
-  "Make an HTTP/1.0 request to Mailpit. Returns the status code and the body
-as octets."
-  (let ((socket (usocket:socket-connect *host* *mailpit-api-port*
-                                        :element-type '(unsigned-byte 8) :timeout 10)))
+(defun http (method path &key (port *mailpit-api-port*) headers body)
+  "Make an HTTP/1.0 request to PORT on *HOST*. HEADERS is an alist; BODY a
+string sent as UTF-8. Returns the status code and the body as octets."
+  (let ((socket (usocket:socket-connect *host* port :element-type '(unsigned-byte 8) :timeout 10))
+        (body (and body (babel:string-to-octets body :encoding :utf-8))))
     (unwind-protect
          (let ((stream (usocket:socket-stream socket)))
            (write-sequence (babel:string-to-octets
-                            (format nil "~a ~a HTTP/1.0~c~cHost: localhost~c~c~c~c"
-                                    method path #\Return #\Linefeed #\Return #\Linefeed
-                                    #\Return #\Linefeed))
+                            (with-output-to-string (s)
+                              (format s "~a ~a HTTP/1.0~c~cHost: localhost~c~c" method path
+                                      #\Return #\Linefeed #\Return #\Linefeed)
+                              (loop for (name . value) in headers
+                                    do (format s "~a: ~a~c~c" name value #\Return #\Linefeed))
+                              (when body
+                                (format s "Content-Length: ~d~c~c" (length body) #\Return #\Linefeed))
+                              (format s "~c~c" #\Return #\Linefeed))
+                            :encoding :utf-8)
                            stream)
+           (when body (write-sequence body stream))
            (force-output stream)
            (let* ((response (let ((out (make-array 0 :element-type '(unsigned-byte 8)
                                                      :adjustable t :fill-pointer 0))
@@ -92,3 +99,22 @@ record. Postfix relays asynchronously, so this can take a moment."
 
 (defun mailpit-reachable-p ()
   (ignore-errors (api "/api/v1/info")))
+
+(defun mailpit-received (record)
+  (let ((headers (mailpit-headers record)))
+    (flet ((mailbox (a) (cons (or (j a "Name") "") (j a "Address"))))
+      (make-received
+       :subject (j record "Subject")
+       :from (mailbox (j record "From"))
+       :to (map 'list #'mailbox (j record "To"))
+       :bcc (map 'list (lambda (a) (j a "Address")) (j record "Bcc"))
+       :text (j record "Text")
+       :html (j record "HTML")
+       :attachments (map 'list (lambda (p)
+                                 (list (j p "FileName") (j p "ContentType")
+                                       (mailpit-part record (j p "PartID"))))
+                         (concatenate 'vector (j record "Attachments") (j record "Inline")))
+       :return-path (let ((v (gethash "Return-Path" headers))) (and v (plusp (length v)) (aref v 0)))
+       :raw (mailpit-raw record)
+       :headers (loop for name being the hash-keys of headers using (hash-value values)
+                      collect (cons name (coerce values 'list)))))))

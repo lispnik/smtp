@@ -1,0 +1,14 @@
+; DKIM keys from t/fixtures (dkim-rsa-pub.pem, dkim-ed25519-pub.pem). The
+; "wrong" selector publishes a different RSA key (that of
+; delivery-other-key.pem), so signatures made with dkim-rsa-pkcs8.pem fail.
+$ORIGIN example.test.
+$TTL 60
+@ IN SOA ns.example.test. hostmaster.example.test. 1 3600 600 86400 60
+@ IN NS ns.example.test.
+ns IN A 127.0.0.1
+rsa._domainkey IN TXT ( "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxma+EzXdk/qhxn5TYw4XzFcWgxDe1rD7P4y9jqUgMkN2gJ2+4z8cMisSnlHe8EiXrBbI3t81Kcd8Kw0slQsF2QIAuRv/oD8o6li4TDiJPZxM5isnMqIP4Ao6e8xRovGj/t9w/s+e+56jln7a204oywYmKEYc"
+                           "pZZfXDRsSmDhEH4qF1OU2hWzXOcngHRZQgoRF1g/3oM3Yi0tnEdtOXPveq5SWM2n3myQs5uuzoLzibA42mssfAnWk+BakWmyX8dnMtuR/KKyxT4mo67PseLpPeGWDePM6G1ZTZMC7I4RnCGNlnhPLRunG1WUSt/KjHDia45Nb7aUOrt7O+IPbR63OQIDAQAB" )
+ed._domainkey IN TXT "v=DKIM1; k=ed25519; p=hzUAA60I2YB+qSxqtfTK4pGPdkG5sEIxSMmj5Sf32Zk="
+wrong._domainkey IN TXT ( "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6nX/glmHk9vcsru1dyl45Pns/sxT0WfMaOqd2JI2jpocNOOSQEiPJ9G2kENF6TPWS63JufDVAD09I1YO4VzdjGe0RZJLk41hPRW7Q4z2mmfs6MtUwDUlR3FMOVgayx5IzxIZUaflaYopRHGSc1lXqU+Q6nWQ"
+                             "5jTW1Jt/L2107sY7ZH/gcLlmuZM8Nlfulng5mDKUaQf/Kk3jkAY/Tp8hYhj/XK43oOUxNz9Kd9ofv0hWvlu6n7NEqTS0CD2YdjvPDrwptYWEYTo+kL2DrSjmJU1HuRpnrmoRJwif4HgrDpOVMxOnwtUKe40MCwkim010oD9HVzNb9b5MtlIJtj4dUQIDAQAB" )
+_dmarc IN TXT "v=DMARC1; p=reject"

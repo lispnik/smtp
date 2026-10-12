@@ -10,7 +10,7 @@ maillog_file = /dev/stdout
 
 # Everything goes to Mailpit, which keeps it for the tests to read.
 relayhost = [mailpit]:1025
-relay_domains = example.test, xn--bcher-kva.example, bücher.example
+relay_domains = example.test, xn--bcher-kva.test, bücher.test
 relay_recipient_maps = texthash:/etc/postfix/relay_recipients
 smtpd_relay_restrictions = permit_sasl_authenticated, reject_unauth_destination
 smtpd_recipient_restrictions =

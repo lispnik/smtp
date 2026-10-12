@@ -4,10 +4,11 @@
 ;;;
 ;;; Copyright (C) 2026 Matthew Kennedy
 
-;;; Messages are sent to Mailpit directly and through Postfix (which relays
-;;; them to Mailpit), then read back through Mailpit's API and compared with
-;;; what was sent. Mailpit parses with Go's mail libraries, independently of
-;;; ours; Postfix is a strict, widely deployed server.
+;;; Messages are sent to Mailpit directly, through Postfix (which relays
+;;; them to Mailpit) and to Stalwart, then read back through Mailpit's API or
+;;; Stalwart's JMAP and compared with what was sent. Mailpit (Go) and
+;;; Stalwart (Rust) parse messages with their own libraries, independently
+;;; of ours; Postfix is a strict, widely deployed server.
 
 (in-package #:smtp/integration)
 
@@ -25,15 +26,24 @@
    (loop for backend in '(:openssl :pure-tls)
          collect (list* :name (format nil "mailpit STARTTLS ~(~a~)" backend) :server :mailpit
                         :port *mailpit-smtp-port* :tls :starttls (tls-options backend)))
-   (list (list :name "postfix plain" :server :postfix :port *postfix-smtp-port* :tls :none))
+   (submission-routes "postfix" :postfix *postfix-smtp-port* *postfix-submission-port*
+                      *postfix-smtps-port* *credentials*)
+   (submission-routes "stalwart" :stalwart *stalwart-smtp-port* *stalwart-submission-port*
+                      *stalwart-smtps-port* *stalwart-credentials*)))
+
+(defun submission-routes (name server smtp-port submission-port smtps-port credentials)
+  "The routes to a full mail server: port 25 in plaintext and with STARTTLS,
+and submission with AUTH after STARTTLS and over implicit TLS."
+  (append
+   (list (list :name (format nil "~a plain" name) :server server :port smtp-port :tls :none))
    (loop for backend in '(:openssl :pure-tls)
-         collect (list* :name (format nil "postfix STARTTLS ~(~a~)" backend) :server :postfix
-                        :port *postfix-smtp-port* :tls :starttls (tls-options backend))
-         collect (list* :name (format nil "postfix submission ~(~a~)" backend) :server :postfix
-                        :port *postfix-submission-port* :tls :starttls :credentials *credentials*
+         collect (list* :name (format nil "~a STARTTLS ~(~a~)" name backend) :server server
+                        :port smtp-port :tls :starttls (tls-options backend))
+         collect (list* :name (format nil "~a submission ~(~a~)" name backend) :server server
+                        :port submission-port :tls :starttls :credentials credentials
                         (tls-options backend))
-         collect (list* :name (format nil "postfix smtps ~(~a~)" backend) :server :postfix
-                        :port *postfix-smtps-port* :tls :implicit :credentials *credentials*
+         collect (list* :name (format nil "~a smtps ~(~a~)" name backend) :server server
+                        :port smtps-port :tls :implicit :credentials credentials
                         (tls-options backend)))))
 
 (defun route (name)
@@ -73,11 +83,15 @@ final line break that MIME encoding may add or drop."
         (v (make-array n :element-type '(unsigned-byte 8))))
     (dotimes (i n v) (setf (aref v i) (random 256 rng)))))
 
-(defun addresses (list)
-  (map 'list (lambda (a) (j a "Address")) list))
+(defun wait-for-received (route message-id recipient)
+  "MESSAGE-ID as received over ROUTE: from Mailpit, or from RECIPIENT's
+mailbox on Stalwart."
+  (if (eq (getf route :server) :stalwart)
+      (wait-for-stalwart recipient message-id)
+      (mailpit-received (wait-for-message-id message-id))))
 
-(defun names (list)
-  (map 'list (lambda (a) (j a "Name")) list))
+(defun header-values (received name)
+  (cdr (assoc name (received-headers received) :test #'string-equal)))
 
 ;;; Round trips: each message, over every route.
 
@@ -87,42 +101,52 @@ final line break that MIME encoding may add or drop."
           (with-output-to-string (s) (dotimes (i 120) (format s "ü~d " i)))))
 
 (defun check-round-trip (route message &key (text (message-text message)) attachments
-                                         (envelope-from nil) (expect-bcc '()))
+                                         (envelope-from nil) (expect-bcc '()) send-options)
   "Send MESSAGE over ROUTE and check what arrived: headers, bodies and
-ATTACHMENTS, a list of (filename content-type octets)."
-  (let* ((result (send-via route message))
-         (got (wait-for-message-id (delivery-result-message-id result))))
-    (is (equal (message-subject message) (j got "Subject")))
-    (is (equal (mailbox-address (message-from message)) (j got "From" "Address")))
-    (is (equal (or (mailbox-display-name (message-from message)) "") (j got "From" "Name")))
-    (is (equal (mapcar #'mailbox-address (message-to message)) (addresses (j got "To"))))
-    (is (equal (mapcar (lambda (m) (or (mailbox-display-name m) "")) (message-to message))
-               (names (j got "To"))))
+ATTACHMENTS, a list of (filename content-type octets). Returns the
+RECEIVED message."
+  (let* ((name (getf route :name))
+         (result (apply #'send-via route message send-options))
+         (got (wait-for-received route (delivery-result-message-id result)
+                                 (or (first expect-bcc) (mailbox-address (first (message-to message))))))
+         (from (message-from message)))
+    (is (equal (message-subject message) (received-subject got)) "~a: subject" name)
+    (is (equal (cons (or (mailbox-display-name from) "") (mailbox-address from)) (received-from got))
+        "~a: From ~s" name (received-from got))
+    (is (equal (mapcar (lambda (m) (cons (or (mailbox-display-name m) "") (mailbox-address m)))
+                       (message-to message))
+               (received-to got))
+        "~a: To ~s" name (received-to got))
     (when expect-bcc
       ;; Bcc is never sent in the headers. Mailpit works it out from the
-      ;; envelope and records it in a Bcc: line of its own, above Return-Path.
-      (is (equal expect-bcc (addresses (j got "Bcc"))))
-      (let ((raw (babel:octets-to-string (mailpit-raw got) :encoding :latin-1)))
-        (is (not (search "Bcc:" raw :start2 (or (search "Return-Path:" raw) 0))))))
+      ;; envelope and records it in a Bcc: line of its own, above Return-Path;
+      ;; Stalwart delivered it to the Bcc recipient's mailbox.
+      (when (eq (getf route :server) :mailpit)
+        (is (equal expect-bcc (received-bcc got))))
+      (let ((raw (babel:octets-to-string (received-raw got) :encoding :latin-1)))
+        (is (not (search (format nil "~%Bcc:") raw :start2 (or (search "Return-Path:" raw) 0)))
+            "~a: Bcc header was sent" name)))
     (when text
-      (is (same-text-p text (j got "Text"))
-          "~a: text body differs:~%sent ~s~%got  ~s" (getf route :name) text (j got "Text")))
+      (is (same-text-p text (received-text got))
+          "~a: text body differs:~%sent ~s~%got  ~s" name text (received-text got)))
     (when (message-html message)
-      (is (same-text-p (message-html message) (j got "HTML"))))
-    ;; The envelope sender, as recorded by the receiving server.
-    (is (equal (format nil "<~a>" (or envelope-from (mailbox-address (message-from message))))
-               (first (coerce (gethash "Return-Path" (mailpit-headers got)) 'list))))
-    (let ((parts (concatenate 'list (j got "Attachments") (j got "Inline"))))
+      (is (same-text-p (message-html message) (received-html got)) "~a: HTML body differs" name))
+    ;; The envelope sender, as recorded by the receiving server (Stalwart
+    ;; records it only for mail arriving on port 25).
+    (when (or (not (eq (getf route :server) :stalwart)) (received-return-path got))
+      (is (equal (format nil "<~a>" (or envelope-from (mailbox-address from)))
+                 (received-return-path got))
+          "~a: Return-Path ~s" name (received-return-path got)))
+    (let ((parts (received-attachments got)))
       (is (= (length attachments) (length parts))
-          "~a: expected ~d attachments, got ~d" (getf route :name) (length attachments) (length parts))
+          "~a: expected ~d attachments, got ~d" name (length attachments) (length parts))
       (loop for (filename content-type octets) in attachments
-            for part = (find filename parts :key (lambda (p) (j p "FileName")) :test #'equal)
+            for part = (find filename parts :key #'first :test #'equal)
             do (is (not (null part)) "~a: no attachment named ~s among ~s"
-                   (getf route :name) filename (map 'list (lambda (p) (j p "FileName")) parts))
+                   name filename (mapcar #'first parts))
                (when part
-                 (is (equal content-type (j part "ContentType")))
-                 (is (equalp octets (mailpit-part got (j part "PartID")))
-                     "~a: attachment ~s content differs" (getf route :name) filename))))
+                 (is (equal content-type (second part)) "~a: ~s has type ~s" name filename (second part))
+                 (is (equalp octets (third part)) "~a: attachment ~s content differs" name filename))))
     got))
 
 (defmacro def-round-trip (name (route) &body body)
@@ -149,7 +173,7 @@ ATTACHMENTS, a list of (filename content-type octets)."
 (def-round-trip utf8-addresses (route)
   ;; SMTPUTF8: a UTF-8 local part and an internationalized domain.
   (check-round-trip route (make-message :from "alice@example.test"
-                                        :to (list "José <josé@example.test>" "erik@bücher.example")
+                                        :to (list "José <josé@example.test>" "erik@bücher.test")
                                         :subject (format nil "SMTPUTF8 via ~a" (getf route :name))
                                         :text "Hola."
                                         :message-id (unique-id))))
@@ -339,12 +363,14 @@ ATTACHMENTS, a list of (filename content-type octets)."
          (result (send-via (route "postfix plain") (simple "DSN")
                            :dsn-notify '(:success) :dsn-return :headers :dsn-envelope-id envid)))
     (wait-for-message-id (delivery-result-message-id result))
-    (let ((report (wait-for (lambda (m)
-                              (and (equal (addresses (j m "To")) '("alice@example.test"))
-                                   (search "Delivery" (j m "Subject"))))
-                            :what "delivery status notification")))
-      (is (search (format nil "Original-Envelope-Id: ~a" envid)
-                  (babel:octets-to-string (mailpit-raw report) :encoding :latin-1))))))
+    ;; Earlier runs' reports may still be in Mailpit: find this one by its
+    ;; envelope id.
+    (is (wait-for (lambda (m)
+                    (and (equal (map 'list (lambda (a) (j a "Address")) (j m "To")) '("alice@example.test"))
+                         (search "Delivery" (j m "Subject"))
+                         (search (format nil "Original-Envelope-Id: ~a" envid)
+                                 (babel:octets-to-string (mailpit-raw m) :encoding :latin-1))))
+                  :what "delivery status notification"))))
 
 (test connection-pool
   (let ((pool (apply #'make-connection-pool *host* :max-connections 4
@@ -362,3 +388,146 @@ ATTACHMENTS, a list of (filename content-type octets)."
         (close-connection-pool pool)))
     (is (= 80 (length (remove-duplicates ids :test #'equal))))
     (dolist (id ids) (is (wait-for-message-id id)))))
+
+;;; DKIM, verified by Stalwart against the keys published by the dns service
+;;; (integration/dns). Stalwart records its verdicts in Authentication-Results
+;;; for mail arriving on port 25.
+
+(defun dkim-key (name)
+  (asdf:system-relative-pathname "smtp" (format nil "t/fixtures/~a" name)))
+
+(defun signer (selector &rest options &key (domain "example.test") &allow-other-keys)
+  (remf options :domain)
+  (apply #'smtp/dkim:make-dkim-signer :domain domain :selector selector
+         :private-key (dkim-key (if (equal selector "ed") "dkim-ed25519.pem" "dkim-rsa-pkcs8.pem"))
+         options))
+
+(defun dkim-results (received)
+  "The DKIM verdicts in RECEIVED's Authentication-Results, as a list of
+(selector . result) strings, and the DMARC result."
+  (let ((ar (format nil "~{~a~^; ~}" (header-values received "Authentication-Results")))
+        (dkim '()))
+    (loop with start = 0
+          for i = (search "dkim=" ar :start2 start)
+          while i
+          do (let* ((end (or (position #\; ar :start i) (length ar)))
+                    (clause (subseq ar i end))
+                    (result (subseq clause 5 (position-if (lambda (c) (member c '(#\Space #\())) clause :start 5)))
+                    (s (search "header.s=" clause)))
+               (push (cons (and s (subseq clause (+ s 9) (position #\Space clause :start s))) result) dkim)
+               (setf start end)))
+    (values (sort dkim #'string< :key #'car)
+            (let ((i (search "dmarc=" ar)))
+              (and i (subseq ar (+ i 6) (position-if (lambda (c) (member c '(#\Space #\; #\())) ar :start (+ i 6))))))))
+
+(defun send-signed (message signers &rest send-options &key (route "stalwart plain") &allow-other-keys)
+  "Send MESSAGE signed by SIGNERS to Stalwart; return the DKIM verdicts and
+the DMARC result."
+  (remf send-options :route)
+  (let ((result (apply #'send-via (route route) message :dkim signers send-options)))
+    (dkim-results (wait-for-stalwart (mailbox-address (first (message-to message)))
+                                     (delivery-result-message-id result)))))
+
+(defun dkim-test-messages ()
+  "Messages whose canonicalization is not trivial: Unicode headers folded
+over several lines, attachments, HTML, dot-stuffed and over-long lines."
+  (list (make-message :from "Ålice Ünïcode <alice@example.test>" :to "山田 太郎 <bob@example.test>"
+                      :cc "carol@example.test"
+                      :subject (format nil "Grüße, 日本語 ~c — a subject long enough to be folded across lines" (code-char #x1F600))
+                      :text *unicode-text* :message-id (unique-id)
+                      :headers '(("X-Extra" . "  spaces   inside  and trailing   ")))
+        (make-message :from "alice@example.test" :to "bob@example.test" :subject "DKIM attachments"
+                      :text "See attached." :html "<p>HTML <b>part</b></p>" :message-id (unique-id)
+                      :attachments (list (make-attachment (random-octets 100000 5) :filename "data.bin")
+                                         (make-attachment (random-octets 2000 6) :filename "logo.png"
+                                                                                 :content-type "image/png"
+                                                                                 :inline t :content-id "logo@example.test")))
+        (make-message :from "alice@example.test" :to "bob@example.test" :subject "DKIM dots"
+                      :text (format nil ".~%..two~%~a~%trailing spaces   ~%~%~%" (make-string 2000 :initial-element #\y))
+                      :message-id (unique-id))))
+
+(test dkim-signatures-verify
+  ;; Both algorithms, every canonicalization, over DATA and BDAT.
+  (dolist (canonicalization '((:relaxed :relaxed) (:simple :simple) (:relaxed :simple) (:simple :relaxed)))
+    (dolist (chunking '(:auto nil))
+      (dolist (message (dkim-test-messages))
+        (multiple-value-bind (dkim dmarc)
+            (send-signed message (list (signer "rsa" :canonicalization canonicalization)
+                                       (signer "ed" :canonicalization canonicalization))
+                         :chunking chunking)
+          (is (equal '(("ed" . "pass") ("rsa" . "pass")) dkim)
+              "~s ~s, chunking ~s: ~s" (message-subject message) canonicalization chunking dkim)
+          (is (equal "pass" dmarc) "~s: DMARC ~s" (message-subject message) dmarc))))))
+
+(test dkim-over-tls
+  (dolist (route '("stalwart STARTTLS openssl" "stalwart STARTTLS pure-tls"))
+    (is (equal '(("ed" . "pass") ("rsa" . "pass"))
+               (send-signed (simple (format nil "DKIM over ~a" route))
+                            (list (signer "rsa") (signer "ed")) :route route)))))
+
+(test dkim-options
+  ;; Expiration, an identity, and signing headers that are absent.
+  (is (equal '(("rsa" . "pass"))
+             (send-signed (simple "DKIM options")
+                          (list (signer "rsa" :expiration 3600 :identity "alice@example.test"
+                                              :headers '("From" "To" "Subject" "Date" "Message-ID"
+                                                         "Reply-To" "In-Reply-To" "List-Id")))))))
+
+(test dkim-wrong-key-fails
+  ;; The "wrong" selector publishes a different key: Stalwart must report a
+  ;; failure, which also shows the passing tests are not vacuous.
+  (multiple-value-bind (dkim dmarc) (send-signed (simple "DKIM wrong key") (list (signer "wrong")))
+    (is (equal '(("wrong" . "fail")) dkim))
+    (is (equal "fail" dmarc))))
+
+(test dkim-internationalized-domain
+  ;; d= is the A-label of bücher.test, which Stalwart looks up in DNS.
+  (is (equal '(("ed" . "pass"))
+             (send-signed (make-message :from "Erik <erik@bücher.test>" :to "bob@example.test"
+                                        :subject "DKIM for bücher.test" :text "Hej." :message-id (unique-id))
+                          (list (signer "ed" :domain "bücher.test"))))))
+
+;;; Stalwart's own rules
+
+(test stalwart-rejections
+  (let ((c (handler-case (progn (send-via (route "stalwart plain")
+                                          (simple "Rejected" :to "bob@example.test, nobody@example.test"))
+                                nil)
+             (smtp-recipients-rejected (c) c))))
+    (is (not (null c)))
+    (when c
+      (is (equal '("nobody@example.test") (mapcar #'car (smtp-recipients-rejected-rejected c))))
+      (is (<= 500 (reply-code (cdr (first (smtp-recipients-rejected-rejected c)))) 599))))
+  ;; No relaying without authentication.
+  (signals smtp-recipients-rejected
+    (send-via (route "stalwart plain") (simple "Relay" :to "someone@example.org")))
+  ;; An authenticated account may send only as itself.
+  (signals smtp-permanent-error
+    (send-via (route "stalwart submission openssl")
+              (simple "Spoofed" :from "carol@example.test")))
+  (dolist (mechanism '(:plain :login))
+    (signals smtp-authentication-failed
+      (open-connection *host* :port *stalwart-submission-port* :tls :starttls
+                              :credentials (list :username "alice@example.test" :password "wrong password")
+                              :auth-mechanism mechanism :local-name "client.example.test"
+                              :ca-file (certificate "ca.pem") :tls-hostname "localhost"))))
+
+(test stalwart-bdat-and-data
+  (dolist (chunking '(:auto nil))
+    (multiple-value-bind (result lines)
+        (traced-send (route "stalwart STARTTLS openssl") (simple (format nil "Chunking ~s" chunking))
+                     :chunking chunking)
+      (is (eq (eq chunking :auto) (and (find-if (lambda (l) (search "BDAT" l)) lines) t)))
+      (is (wait-for-stalwart "bob@example.test" (delivery-result-message-id result))))))
+
+(test stalwart-no-credentials-without-tls
+  ;; Before STARTTLS, Stalwart's port 587 offers AUTH (OAUTHBEARER and
+  ;; XOAUTH2), so the client itself must refuse to send credentials.
+  (let ((lines '()))
+    (signals smtp-insecure-authentication
+      (open-connection *host* :port *stalwart-submission-port* :tls :none
+                              :credentials (list :username "alice@example.test" :oauth2-token "token")
+                              :local-name "client.example.test"
+                              :trace (lambda (direction line)
+                                       (when (eq direction :client) (push line lines)))))
+    (is (notany (lambda (l) (search "AUTH" l)) lines))))

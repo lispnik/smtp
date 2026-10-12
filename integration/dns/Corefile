@@ -1,0 +1,18 @@
+# DNS for the Stalwart integration tests: the DKIM keys and DMARC policies of
+# the test domains, so Stalwart can verify the signatures the client makes.
+# Every other name does not exist (rather than the lookup being refused,
+# which mail checks treat as a temporary error).
+example.test {
+  file /etc/coredns/example.test.zone
+  errors
+}
+xn--bcher-kva.test {
+  file /etc/coredns/xn--bcher-kva.test.zone
+  errors
+}
+. {
+  template ANY ANY {
+    rcode NXDOMAIN
+  }
+  errors
+}

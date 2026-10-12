@@ -1,0 +1,8 @@
+; bücher.test, signed with the Ed25519 key of t/fixtures.
+$ORIGIN xn--bcher-kva.test.
+$TTL 60
+@ IN SOA ns.xn--bcher-kva.test. hostmaster.xn--bcher-kva.test. 1 3600 600 86400 60
+@ IN NS ns.xn--bcher-kva.test.
+ns IN A 127.0.0.1
+ed._domainkey IN TXT "v=DKIM1; k=ed25519; p=hzUAA60I2YB+qSxqtfTK4pGPdkG5sEIxSMmj5Sf32Zk="
+_dmarc IN TXT "v=DMARC1; p=reject"
