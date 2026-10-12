@@ -148,10 +148,11 @@ CONNECTION was idle. Either way it cannot be used."
        (not (%readable-p connection))))
 
 (defun %release-slot (pool)
-  "Give up one slot, waking one waiting thread to take it."
+  "Give up one slot, waking the waiting threads. Waking only one could lose
+the wakeup, if that thread were unwound before taking the slot."
   (bt2:with-lock-held ((%pool-lock pool))
     (decf (%pool-size pool))
-    (bt2:condition-notify (%pool-available pool))))
+    (bt2:condition-broadcast (%pool-available pool))))
 
 (defun %close-entry (entry wait)
   "Close ENTRY's connection with QUIT, waiting for the reply only if WAIT."
@@ -260,12 +261,17 @@ idle longer than the pool's CHECK-AFTER."
                         (unless ok (%release-slot pool))))
                     (return (%open-entry pool)))
           ((nil) (return (%open-entry pool)))
-          (t (if (%alive-p pool entry)
-                 (progn (setf (%pooled-reused entry) t)
-                        (bt2:with-lock-held ((%pool-lock pool))
-                          (incf (%pool-reuses pool)))
-                        (return entry))
-                 (%retire pool (list entry) :wait nil))))))))
+          (t (let ((alive nil) (checked nil))
+               ;; The entry holds a slot: give it back however the check ends.
+               (unwind-protect (setf alive (%alive-p pool entry) checked t)
+                 (unless checked
+                   (%retire pool (list entry) :wait nil)))
+               (if alive
+                   (progn (setf (%pooled-reused entry) t)
+                          (bt2:with-lock-held ((%pool-lock pool))
+                            (incf (%pool-reuses pool)))
+                          (return entry))
+                   (%retire pool (list entry) :wait nil)))))))))
 
 (defun %checkin (pool entry)
   (let* ((connection (%pooled-connection entry))
@@ -278,7 +284,7 @@ idle longer than the pool's CHECK-AFTER."
       (if (and keep (not (%pool-closed pool))
                (< (length (%pool-idle pool)) (%pool-max-idle pool)))
           (progn (push entry (%pool-idle pool))
-                 (bt2:condition-notify (%pool-available pool)))
+                 (bt2:condition-broadcast (%pool-available pool)))
           (setf keep nil)))
     (unless keep
       (%retire pool (list entry)))))

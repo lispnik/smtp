@@ -70,6 +70,11 @@ line and paragraph separators, which some readers also take as line breaks."
   (let ((code (char-code char)))
     (or (< code 32) (<= 127 code 159) (= code #x2028) (= code #x2029))))
 
+(defun ascii-digit-p (char &optional (radix 10))
+  "The weight of CHAR as an ASCII digit in RADIX, or NIL. DIGIT-CHAR-P also
+accepts other scripts' digits, such as Arabic-Indic and full-width ones."
+  (and (< (char-code char) 128) (digit-char-p char radix)))
+
 (defun line-break-char-p (char)
   (or (char= char #\Return) (char= char #\Linefeed)))
 

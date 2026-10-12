@@ -72,8 +72,8 @@ when the lookup fails."
   host addresses security tls verify tls-hostname reason)
 
 (defun %addresses (host resolver)
-  "HOST's addresses (IPv4 first), whether every answer was secure, and the
-CNAME-expanded name."
+  "HOST's addresses (IPv4 first), whether every answer received was secure,
+the CNAME-expanded name, and whether one of the two lookups failed."
   (let ((addresses '()) (secure t) (canonical nil) (errors 0))
     (dolist (type '(:a :aaaa))
       (handler-case
@@ -82,10 +82,10 @@ CNAME-expanded name."
             (unless (dns-answer-secure answer) (setf secure nil))
             (when (dns-answer-records answer)
               (setf canonical (or canonical (dns-answer-canonical-name answer)))))
-        (dns-error () (incf errors) (setf secure nil))))
+        (dns-error () (incf errors))))
     (when (= errors 2)
       (error 'dns-error :name host :message (format nil "Cannot look up the address of ~a" host)))
-    (values addresses secure canonical)))
+    (values addresses secure canonical (plusp errors))))
 
 (defun %tlsa-lookup (base resolver port)
   "The secure TLSA records for BASE, :INSECURE, or :NONE. A failed lookup
@@ -96,11 +96,28 @@ signals: the host must then be treated as unreachable (RFC 7672 2.1.2)."
            (mapcar (lambda (r) (apply #'make-tlsa r)) (dns-answer-records answer)))
           (t :none))))
 
+(defun %literal-route (host require-tls)
+  "The route to an address literal: opportunistic TLS, or with REQUIRE-TLS,
+a certificate verified for that address."
+  (let ((address (smtp::%normalize-host host)))
+    (if require-tls
+        (%make-route :host host :addresses (list address)
+                     :security :tls :tls :starttls :verify t :tls-hostname address)
+        (%make-route :host host :addresses (list address)
+                     :security :opportunistic-tls :tls :opportunistic :tls-hostname nil))))
+
 (defun %plan-route (host domain mx-secure policy resolver &key dane require-tls (tlsa-port 25))
-  (multiple-value-bind (addresses secure canonical) (%addresses host resolver)
+  (multiple-value-bind (addresses secure canonical failed) (%addresses host resolver)
     (let ((route (%make-route :host host :addresses addresses)))
       (when (null addresses)
         (setf (route-reason route) (format nil "~a has no address" host))
+        (return-from %plan-route route))
+      ;; A failed lookup does not show that the host is unsigned (RFC 7672
+      ;; section 2.1.2); where DANE could apply, the host is skipped rather
+      ;; than sent mail without its TLSA records being checked.
+      (when (and failed dane mx-secure secure)
+        (setf (route-reason route)
+              (format nil "Cannot look up every address of ~a, so DANE cannot be checked" host))
         (return-from %plan-route route))
       ;; DANE: only when the MX and address answers are both validated.
       (when (and dane mx-secure secure)
@@ -230,9 +247,7 @@ those still :DEFERRED may be tried at another host."
                 (setf last-host host)
                 (let ((route (handler-case
                                  (if (smtp::%address-literal-p host)
-                                     (%make-route :host host :addresses (list (smtp::%normalize-host host))
-                                                  :security :opportunistic-tls :tls :opportunistic
-                                                  :tls-hostname nil)
+                                     (%literal-route host require-tls)
                                      (%plan-route host domain mx-secure policy resolver
                                                   :dane dane :require-tls require-tls))
                                (dns-error (e) (%make-route :host host :reason (princ-to-string e))))))

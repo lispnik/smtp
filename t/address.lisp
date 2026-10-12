@@ -81,3 +81,9 @@
   (signals invalid-address (parse-mailbox "a@xn--zzzzzzzzzzzz-.example"))
   (signals invalid-address (domain-to-ascii "xn--a.example"))
   (is (string= "a@[IPv6:::1]" (mailbox-address (parse-mailbox "a@[IPv6:::1]")))))
+
+(test only-ascii-digits-are-numbers
+  ;; SBCL's DIGIT-CHAR-P accepts every Unicode decimal digit.
+  (signals invalid-address (parse-mailbox (format nil "user@[~c27.0.0.1]" (code-char #x0661))))
+  (signals invalid-address (parse-mailbox (format nil "user@[IPv6:~c::1]" (code-char #xFF11))))
+  (is (null (smtp::%ip-literal-p (format nil "~c27.0.0.1" (code-char #xFF11))))))

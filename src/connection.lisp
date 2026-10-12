@@ -241,7 +241,7 @@ reply)."
 
 (defun %ip-literal-p (host)
   (or (find #\: host)
-      (and (every (lambda (c) (or (digit-char-p c) (char= c #\.))) host)
+      (and (every (lambda (c) (or (ascii-digit-p c) (char= c #\.))) host)
            (= 3 (count #\. host)))))
 
 (defun %normalize-host (host)

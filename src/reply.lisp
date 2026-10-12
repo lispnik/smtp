@@ -61,7 +61,7 @@ class agrees with CODE."
                       collect (subseq token start pos)
                       while pos do (setf start (1+ pos)))))
     (when (and (= (length parts) 3)
-               (every (lambda (p) (and (<= 1 (length p) 3) (every #'digit-char-p p))) parts)
+               (every (lambda (p) (and (<= 1 (length p) 3) (every #'ascii-digit-p p))) parts)
                (= (length (first parts)) 1)
                (= (parse-integer (first parts)) (floor code 100)))
       token)))

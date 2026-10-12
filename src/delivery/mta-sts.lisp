@@ -68,7 +68,7 @@ if it is not a valid STSv1 policy."
              (mode (alexandria:switch ((field "mode") :test #'equal)
                      ("enforce" :enforce) ("testing" :testing) ("none" :none)))
              (age-text (field "max_age"))
-             (max-age (and age-text (<= 1 (length age-text) 10) (every #'digit-char-p age-text)
+             (max-age (and age-text (<= 1 (length age-text) 10) (every #'smtp::ascii-digit-p age-text)
                            (parse-integer age-text)))
              (mx (loop for (k . v) in fields
                        when (string= k "mx") collect (string-downcase (string-right-trim "." v)))))

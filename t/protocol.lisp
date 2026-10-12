@@ -429,3 +429,68 @@ pauses, :close ends the session."
     (close-connection (open-connection "127.0.0.1" :port port :tls :none :local-name "bücher.example"))
     (is (equal '("EHLO xn--bcher-kva.example") (sent-commands s "EHLO"))))
   (signals mail-format-error (open-connection "127.0.0.1" :port 1 :tls :none :local-name "[foo bar]")))
+
+(test interrupted-message-data-does-not-hang
+  ;; A non-SMTP error while the message data is being sent leaves the server
+  ;; reading data: RSET would be read as part of the message, and its reply
+  ;; never comes. The connection is broken instead.
+  (with-mock-server (port s (standard-server))
+    (let ((c (connect port :trace (lambda (direction line)
+                                    (when (and (eq direction :client) (string-prefix-p "[" line))
+                                      (error "trace failed")))))
+          (start (get-internal-real-time)))
+      (unwind-protect
+           (progn
+             (signals simple-error (send-message c (simple-message)))
+             (is (< (/ (- (get-internal-real-time) start) internal-time-units-per-second) 2))
+             (is (eq :broken (smtp::connection-state c))))
+        (close-connection c)))
+    (is (null (sent-commands s "RSET")))))
+
+
+(defun reply-when-idle-server (largest)
+  "A pipelining server that answers commands only once the client stops
+sending, calling LARGEST with the most commands it ever received before
+answering. A client that never stops to read replies would, with real
+socket buffers, deadlock against a server that blocks writing them."
+  (lambda (session)
+    (let ((most 0) (pending '()))
+      (labels ((more-p ()
+                 (or (listen (session-stream session))
+                     (usocket:wait-for-input (session-socket session) :timeout 0.2 :ready-only t)))
+               (answer ()
+                 (setf most (max most (length pending)))
+                 (apply #'srv-send session (nreverse pending))
+                 (setf pending '())))
+        (srv-send session "220 idle.test ESMTP")
+        (loop for line = (srv-read-line session :record nil)
+              while line
+              do (let ((verb (%verb line)))
+                   (cond ((string= verb "EHLO") (srv-send session "250-idle.test" "250 PIPELINING"))
+                         ((member verb '("MAIL" "RCPT") :test #'string=)
+                          (push "250 ok" pending)
+                          (unless (more-p) (answer)))
+                         ((string= verb "DATA")
+                          (when pending (answer))
+                          (srv-send session "354 go")
+                          (srv-read-data session)
+                          (srv-send session "250 queued"))
+                         ((string= verb "QUIT") (srv-send session "221 bye") (return))
+                         (t (srv-send session "250 ok")))))
+        (funcall largest most)))))
+
+(test pipelining-reads-replies-as-it-goes
+  ;; RFC 2920 section 3.1: a client must not send so many commands without
+  ;; reading replies that both directions' buffers fill and the two sides
+  ;; deadlock. Thousands of recipients go out in bounded batches.
+  (let ((recipients (loop for i below 5000 collect (format nil "r~d@example.org" i)))
+        (largest nil))
+    (with-mock-server (port s (reply-when-idle-server (lambda (n) (setf largest n))))
+      (let ((c (connect port)))
+        (unwind-protect
+             (is (= 5000 (length (delivery-result-accepted
+                                  (send-raw-message c (render-message (simple-message))
+                                                    :envelope-from "alice@example.com"
+                                                    :recipients recipients)))))
+          (close-connection c))))
+    (is (<= largest 1000) "~d commands were sent before a reply was read" largest)))

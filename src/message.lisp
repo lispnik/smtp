@@ -27,11 +27,15 @@
 (defun %invisible-char-p (char)
   "Whether CHAR changes how a name displays without being seen: the bidi
 controls, which can make \"invoice<U+202E>fdp.exe\" display as
-\"invoiceexe.pdf\", and the zero-width characters that are not needed to
-join letters (U+200C and U+200D are)."
+\"invoiceexe.pdf\", and Unicode's other default-ignorable characters
+(invisible fillers, format and tag characters), except the joiners U+200C
+and U+200D and the variation selectors, which some scripts and emoji need."
   (let ((code (char-code char)))
-    (or (= code #x061C) (= code #x200B) (= code #x200E) (= code #x200F)
-        (<= #x202A code #x202E) (= code #x2060) (<= #x2066 code #x2069) (= code #xFEFF))))
+    (or (= code #x00AD) (= code #x034F) (= code #x061C) (<= #x115F code #x1160)
+        (<= #x17B4 code #x17B5) (= code #x180E) (= code #x200B) (<= #x200E code #x200F)
+        (<= #x202A code #x202E) (<= #x2060 code #x206F) (= code #x3164) (= code #xFEFF)
+        (= code #xFFA0) (<= #xFFF0 code #xFFFB) (<= #x1BCA0 code #x1BCA3)
+        (<= #x1D173 code #x1D17A) (<= #xE0000 code #xE00FF))))
 
 (defun %sanitize-filename (name)
   (let* ((base (subseq name (1+ (or (position-if (lambda (c) (find c "/\\")) name :from-end t)

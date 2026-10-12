@@ -83,7 +83,13 @@ Returns the QUEUED-MESSAGE."
     (or (nth (1- attempts) schedule) (car (last schedule)))))
 
 (defun %notify (fn item statuses)
-  (when (and fn statuses) (funcall fn item statuses)))
+  "Call FN with ITEM and STATUSES, if there are any. The attempt is already
+recorded, so an error in FN is only reported: it must not stop the other
+callbacks, or have the item retried."
+  (when (and fn statuses)
+    (handler-case (funcall fn item statuses)
+      (error (e)
+        (warn "A delivery queue callback failed for ~a: ~a" (queued-message-id item) e)))))
 
 (defun %process-item (queue item now)
   (let* ((statuses (apply #'deliver-raw-message (queued-message-octets item)
@@ -126,6 +132,28 @@ Returns the QUEUED-MESSAGE."
         (%notify (%on-failed queue) item failed)
         (%notify (%on-deferred queue) item deferred)))))
 
+(defun %attempt-failed (queue item now condition)
+  (let ((expired (>= (- now (queued-message-queued-at item)) (delivery-queue-give-up-after queue)))
+        (failed '()))
+    (bt:with-lock-held ((%queue-lock queue))
+      (incf (queued-message-attempts item))
+      (if expired
+          (let ((message (format nil "Gave up after ~d attempts: ~a"
+                                 (queued-message-attempts item) condition)))
+            (setf failed (mapcar (lambda (r) (%status r :failed :message message))
+                                 (queued-message-recipients item))
+                  (queued-message-statuses item)
+                  (append (remove-if (lambda (s) (member (recipient-status-recipient s)
+                                                         (queued-message-recipients item)
+                                                         :test #'string-equal))
+                                     (queued-message-statuses item))
+                          failed)
+                  (queued-message-recipients item) '()
+                  (%items queue) (remove item (%items queue))))
+          (setf (queued-message-next-attempt item)
+                (+ now (%retry-delay queue (queued-message-attempts item))))))
+    (%notify (%on-failed queue) item failed)))
+
 (defun run-delivery-queue (queue &key (now (get-universal-time)))
   "Attempt every message that is due. Returns the number attempted."
   (let ((due (bt:with-lock-held ((%queue-lock queue))
@@ -138,10 +166,8 @@ Returns the QUEUED-MESSAGE."
     (dolist (item due)
       (handler-case (%process-item queue item now)
         (error (e)
-          ;; A bug or a local problem: keep the message and try later.
-          (bt:with-lock-held ((%queue-lock queue))
-            (incf (queued-message-attempts item))
-            (setf (queued-message-next-attempt item)
-                  (+ now (%retry-delay queue (queued-message-attempts item)))))
-          (warn "Delivery of ~a failed: ~a" (queued-message-id item) e))))
+          ;; A bug or a local problem: keep the message and try later,
+          ;; unless it has been queued too long.
+          (warn "Delivery of ~a failed: ~a" (queued-message-id item) e)
+          (%attempt-failed queue item now e))))
     (length due)))

@@ -74,7 +74,8 @@ The second value is the number of dots added."
 (defun %size-limit (connection)
   (let ((params (connection-extension connection "SIZE")))
     (and params
-         (let ((n (ignore-errors (parse-integer (first params)))))
+         (let ((n (and (every #'ascii-digit-p (first params))
+                        (ignore-errors (parse-integer (first params))))))
            (and n (plusp n) n)))))
 
 (defun %notify-param (notify)
@@ -101,20 +102,28 @@ The second value is the number of dots added."
                                (%xtext (mailbox-address rcpt)))))
                 recipients)))
 
+(defparameter *pipelining-batch* 100
+  "The most commands sent before their replies are read. Without a bound, a
+server answering thousands of RCPTs while the client is still writing them
+can fill the buffers both ways and deadlock with it (RFC 2920 section 3.1).")
+
 (defun %send-envelope (connection commands)
   "Send MAIL and RCPT COMMANDS, pipelined when the server allows it, and
 return their replies. A failed MAIL is signalled at once."
   (if (nth-value 1 (connection-extension connection "PIPELINING"))
-      (progn
-        (%send-commands connection commands)
-        (let ((replies (loop for line in commands
-                             for reply = (read-reply connection)
-                             collect reply
-                             ;; The server is closing; nothing more will come.
-                             do (when (= (reply-code reply) 421)
-                                  (check-reply connection reply line '(2))))))
-          (check-reply connection (first replies) (first commands) '(2))
-          replies))
+      (let ((replies '()))
+        (loop for start from 0 below (length commands) by *pipelining-batch*
+              for batch = (subseq commands start (min (length commands) (+ start *pipelining-batch*)))
+              do (%send-commands connection batch)
+                 (dolist (line batch)
+                   (let ((reply (read-reply connection)))
+                     (push reply replies)
+                     ;; The server is closing; nothing more will come.
+                     (when (= (reply-code reply) 421)
+                       (check-reply connection reply line '(2)))))
+                 ;; A refused MAIL: the remaining RCPTs would fail too.
+                 (check-reply connection (car (last replies)) (first commands) '(2)))
+        (nreverse replies))
       (let ((mail (command connection (first commands))))
         (cons mail
               (mapcar (lambda (rcpt)
@@ -124,12 +133,24 @@ return their replies. A failed MAIL is signalled at once."
                           reply))
                       (rest commands))))))
 
+(defmacro %while-unsynchronized ((connection) &body body)
+  "Evaluate BODY, which sends message data. If it exits non-locally before
+the server's reply is read, the server is left reading data, so nothing
+more can be said to it: CONNECTION is marked :BROKEN, and no RSET is sent."
+  (alexandria:with-gensyms (ok)
+    (alexandria:once-only (connection)
+      `(let ((,ok nil))
+         (unwind-protect (multiple-value-prog1 (progn ,@body) (setf ,ok t))
+           (unless ,ok
+             (setf (connection-state ,connection) :broken)))))))
+
 (defun %send-data (connection data)
   (command connection "DATA" :expect '(354))
-  (%trace connection :client (format nil "[~:d octets of message data]" (length data)))
-  (%write-octets connection data)
-  (send-command connection ".")
-  (read-reply connection :timeout (connection-data-timeout connection)))
+  (%while-unsynchronized (connection)
+    (%trace connection :client (format nil "[~:d octets of message data]" (length data)))
+    (%write-octets connection data)
+    (send-command connection ".")
+    (read-reply connection :timeout (connection-data-timeout connection))))
 
 (defparameter *bdat-chunk-size* (* 1024 1024))
 
@@ -141,17 +162,19 @@ return their replies. A failed MAIL is signalled at once."
         (loop for start from 0 below n by *bdat-chunk-size*
               for end = (min n (+ start *bdat-chunk-size*))
               for last = (= end n)
-              do (let ((line (format nil "BDAT ~d~:[~; LAST~]" (- end start) last)))
-                   (send-command connection line)
-                   (%trace connection :client (format nil "[~:d octets of message data]" (- end start)))
-                   (%write-octets connection data :start start :end end)
-                   (let ((reply (read-reply connection
-                                            :timeout (if last
-                                                         (connection-data-timeout connection)
-                                                         (connection-timeout connection)))))
-                     (if last
-                         (return reply)
-                         (check-reply connection reply line '(2)))))))))
+              do (let* ((line (format nil "BDAT ~d~:[~; LAST~]" (- end start) last))
+                        (reply (%while-unsynchronized (connection)
+                                 (send-command connection line)
+                                 (%trace connection :client
+                                         (format nil "[~:d octets of message data]" (- end start)))
+                                 (%write-octets connection data :start start :end end)
+                                 (read-reply connection
+                                             :timeout (if last
+                                                          (connection-data-timeout connection)
+                                                          (connection-timeout connection))))))
+                   (if last
+                       (return reply)
+                       (check-reply connection reply line '(2))))))))
 
 (defun send-raw-message (connection data &key envelope-from recipients smtputf8
                                             (on-rejected-recipient :error)

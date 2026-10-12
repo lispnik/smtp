@@ -118,7 +118,7 @@ breaks so that no encoded line exceeds 76 characters."
   "Decode quoted-printable STRING to octets. Soft line breaks are removed and
 hard line breaks become CRLF."
   (let ((buffer (make-octet-buffer)) (i 0) (n (length string)))
-    (flet ((hex (c) (digit-char-p c 16)))
+    (flet ((hex (c) (ascii-digit-p c 16)))
       (loop while (< i n)
             do (let ((c (char string i)))
                  (cond ((and (char= c #\=) (< (+ i 2) n)

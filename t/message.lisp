@@ -436,3 +436,9 @@ from email import policy
 m = email.message_from_string(sys.stdin.read(), policy=policy.default)
 sys.stdout.write(m['From'].addresses[0].display_name + '|' + str(m['Subject']))")
                     :input (make-string-input-stream text) :output :string))))))
+
+(test more-invisible-characters-leave-filenames
+  (flet ((name (n) (attachment-filename (make-attachment (octets "x") :filename n))))
+    (dolist (code '(#x00AD #x034F #x115F #x180E #x2062 #x206A #x3164 #xFFA0 #xFFF9 #xE0041))
+      (is (string= "report.pdf.exe" (name (format nil "report.p~cdf.exe" (code-char code))))
+          "U+~4,'0x was kept" code))))

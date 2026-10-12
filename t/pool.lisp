@@ -497,3 +497,40 @@ a reply line."
       (is (= 1 (stat pool :idle))))
     (is (= 2 (length (server-session-list server))))
     (is (sent-commands (first (server-session-list server)) "QUIT"))))
+
+(test failing-liveness-check-frees-the-slot
+  ;; Something other than an SMTP error escapes the NOOP sent to check a
+  ;; long-idle connection: its slot must still be given back.
+  (with-pool-server (port server (scripted-server))
+    (with-pool (pool port :max-connections 1 :check-after 0 :wait-timeout 0.5
+                          :trace (lambda (direction line)
+                                   (when (and (eq direction :client) (string= line "NOOP"))
+                                     (error "trace failed"))))
+      (pool-send-message pool (simple-message))
+      (sleep 0.01)
+      (signals simple-error (pool-send-message pool (simple-message)))
+      (is (= 0 (stat pool :connections))))))
+
+(test freed-slots-wake-every-waiter
+  ;; Every waiting thread is woken, so that one unwound before it takes the
+  ;; slot cannot leave the others asleep beside a free slot.
+  (with-pool-server (port server (scripted-server))
+    (with-pool (pool port :max-connections 1)
+      (let* ((lock (smtp::%pool-lock pool))
+             (available (smtp::%pool-available pool))
+             (prompt 0)
+             (count-lock (bt:make-lock))
+             (threads (loop repeat 2
+                            collect (bt:make-thread
+                                     (lambda ()
+                                       (let ((start (get-internal-real-time)))
+                                         (bt2:with-lock-held (lock)
+                                           (bt2:condition-wait available lock :timeout 2))
+                                         (when (< (- (get-internal-real-time) start)
+                                                  internal-time-units-per-second)
+                                           (bt:with-lock-held (count-lock) (incf prompt)))))))))
+        (sleep 0.2)
+        (bt2:with-lock-held (lock) (incf (smtp::%pool-size pool)))
+        (smtp::%release-slot pool)
+        (mapc #'bt:join-thread threads)
+        (is (= 2 prompt))))))

@@ -705,3 +705,73 @@
       (is (equal '(:failed) (mapcar #'d:recipient-status-status failed)))
       (is (search "Gave up" (d:recipient-status-message (first failed))))
       (is (null (d:delivery-queue-messages queue))))))
+
+(test failed-address-lookup-does-not-disable-dane
+  ;; The AAAA lookup for mx1 fails: that is not proof that mx1 is unsigned,
+  ;; so it must not be sent mail without its TLSA records being checked.
+  (let ((zone (dane-zone (server-tlsa :fixture "delivery-other.pem"))))
+    (push '("mx1.example.test" . :aaaa) (zone-failing zone))
+    (with-mock-dns (r zone)
+      (with-delivery-certificate ()
+        (with-mock-server (p1 s1 (standard-server :extensions '("STARTTLS")) :timeout 1)
+          (with-mock-server (p2 s2 (standard-server))
+            (let ((bob (first (deliver r (ports :mx1 p1 :mx2 p2)))))
+              (is (eq :delivered (d:recipient-status-status bob)) "~a" (d:recipient-status-message bob))
+              (is (string= "mx2.example.test" (d:recipient-status-host bob))))
+            (is (null (sent-commands s1 "MAIL")))))))))
+
+(test require-tls-applies-to-address-literals
+  (with-mock-server (port s (standard-server))
+    (let ((status (first (d:deliver-message (simple-message :to "bob@[127.0.0.1]")
+                                            :require-tls t
+                                            :resolver (d:make-resolver :nameservers '("127.0.0.1")
+                                                                       :port *closed-port* :timeout 0.2)
+                                            :port (lambda (host address) (declare (ignore host address)) port)
+                                            :local-name "client.test" :connect-timeout 5 :timeout 5))))
+      (is (eq :deferred (d:recipient-status-status status))))
+    (is (null (sent-commands s "MAIL")))))
+
+(test mta-sts-max-age-is-ascii
+  (is (null (d:parse-mta-sts-policy
+             (crlf "version: STSv1" "mode: enforce" "mx: a.test"
+                   (format nil "max_age: ~c0" (code-char #xFF18)))))))
+
+(test queue-callback-errors-lose-nothing
+  ;; ON-DELIVERED fails; the failed recipient must still be reported.
+  (with-mock-dns (r (example-zone))
+    (with-mock-server (p s (standard-server :reject-recipients '("carol@example.test")))
+      (let* ((failed '())
+             (queue (d:make-delivery-queue :resolver r :local-name "client.test" :mta-sts nil
+                                           :timeout 5 :connect-timeout 5 :port (ports :mx1 p)
+                                           :on-delivered (lambda (item statuses)
+                                                           (declare (ignore item statuses))
+                                                           (error "logging failed"))
+                                           :on-failed (lambda (item statuses)
+                                                        (declare (ignore item))
+                                                        (setf failed statuses)))))
+        (d:enqueue-message queue (simple-message :to "bob@example.test" :cc "carol@example.test") :now 0)
+        (handler-bind ((warning #'muffle-warning))
+          (d:run-delivery-queue queue :now 0))
+        (is (equal '("carol@example.test") (mapcar #'d:recipient-status-recipient failed)))
+        (is (null (d:delivery-queue-messages queue)))))))
+
+(test queue-gives-up-on-local-errors
+  ;; Every attempt fails with a local error; the message still expires.
+  (with-mock-dns (r (example-zone))
+    (let* ((failed '())
+           (queue (d:make-delivery-queue :resolver r :local-name "client.test" :mta-sts nil
+                                         :timeout 5 :connect-timeout 5 :give-up-after 3600
+                                         :port (lambda (host address)
+                                                 (declare (ignore host address))
+                                                 (error "no port configured"))
+                                         :on-failed (lambda (item statuses)
+                                                      (declare (ignore item))
+                                                      (setf failed statuses)))))
+      (d:enqueue-message queue (simple-message :to "bob@example.test") :now 0)
+      (handler-bind ((warning #'muffle-warning))
+        (d:run-delivery-queue queue :now 0)
+        (is (null failed))
+        (d:run-delivery-queue queue :now 7200))
+      (is (equal '(:failed) (mapcar #'d:recipient-status-status failed)))
+      (is (search "no port configured" (d:recipient-status-message (first failed))))
+      (is (null (d:delivery-queue-messages queue))))))
