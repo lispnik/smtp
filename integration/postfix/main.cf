@@ -1,0 +1,33 @@
+# Postfix for the smtp integration tests; see Dockerfile.
+compatibility_level = 3.6
+myhostname = postfix.example.test
+mydomain = example.test
+myorigin = $mydomain
+mydestination =
+mynetworks = 127.0.0.0/8
+inet_protocols = ipv4
+maillog_file = /dev/stdout
+
+# Everything goes to Mailpit, which keeps it for the tests to read.
+relayhost = [mailpit]:1025
+relay_domains = example.test, xn--bcher-kva.example, bücher.example
+relay_recipient_maps = texthash:/etc/postfix/relay_recipients
+smtpd_relay_restrictions = permit_sasl_authenticated, reject_unauth_destination
+smtpd_recipient_restrictions =
+# Bounces from the tests would only clutter Mailpit.
+notify_classes =
+
+message_size_limit = 10485760
+smtputf8_enable = yes
+smtpd_helo_required = yes
+
+smtpd_tls_chain_files = /certs/server-key.pem, /certs/server-chain.pem
+smtpd_tls_security_level = may
+smtpd_tls_auth_only = yes
+smtp_tls_security_level = none
+
+smtpd_sasl_type = cyrus
+smtpd_sasl_path = smtpd
+smtpd_sasl_local_domain = example.test
+smtpd_sasl_auth_enable = no
+broken_sasl_auth_clients = no

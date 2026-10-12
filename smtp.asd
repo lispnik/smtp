@@ -92,3 +92,18 @@
   :perform (asdf:test-op (o c)
              (unless (uiop:symbol-call :fiveam :run! :smtp)
                (error "smtp tests failed"))))
+
+(asdf:defsystem #:smtp/integration
+  :description "Tests of smtp against real servers (Mailpit, Postfix) run in
+Docker; see integration/compose.yaml and make integration."
+  :author      "Matthew Kennedy"
+  :license     "MIT"
+  :version     "0.3.0"
+  :depends-on  ("smtp" "smtp/pure-tls" "fiveam" "bordeaux-threads" "usocket" "com.inuoe.jzon")
+  :serial t
+  :components ((:file "integration/package")
+               (:file "integration/mailpit")
+               (:file "integration/tests"))
+  :perform (asdf:test-op (o c)
+             (unless (uiop:symbol-call :smtp/integration :run-tests)
+               (error "smtp integration tests failed"))))

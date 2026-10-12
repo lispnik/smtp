@@ -1,0 +1,8 @@
+# Recipients Postfix accepts; any other at example.test is rejected with 550.
+alice@example.test OK
+bob@example.test OK
+carol@example.test OK
+dave@example.test OK
+josé@example.test OK
+erik@xn--bcher-kva.example OK
+erik@bücher.example OK

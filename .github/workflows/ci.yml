@@ -57,3 +57,37 @@ jobs:
 
       - name: Test
         run: make test
+
+  integration:
+    name: Integration (Mailpit, Postfix)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the servers
+        run: docker compose -f integration/compose.yaml up -d --build --wait --quiet-build --quiet-pull
+
+      # The tests run in the same Debian 13 image as the test job, on the
+      # host's network so the servers' published ports are on localhost.
+      - name: Test
+        run: |
+          docker run --rm --network host -v "$PWD:/w" -w /w debian:13 bash -euc '
+            apt-get update -q
+            apt-get install -y -q --no-install-recommends \
+              sbcl git make ca-certificates openssl libssl-dev > /dev/null
+            git config --global --add safe.directory /w
+            git clone -q --depth 1 https://github.com/ocicl/ocicl.git /tmp/ocicl-src
+            (cd /tmp/ocicl-src && sbcl --non-interactive --load setup.lisp > /dev/null)
+            export PATH="$HOME/.local/bin:$PATH"
+            ocicl setup > ~/.sbclrc
+            for attempt in 1 2 3 4; do
+              ocicl install > /dev/null && break
+              echo "ocicl install failed (attempt $attempt); retrying"
+              sleep $((attempt * 10))
+            done
+            make integration-run'
+
+      - name: Server logs
+        if: failure()
+        run: docker compose -f integration/compose.yaml logs

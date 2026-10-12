@@ -440,6 +440,32 @@ installed.
 
 Pick sections with `STRESS=pool,messages make stress`.
 
+`make integration` tests against real servers running in Docker:
+[Mailpit](https://mailpit.axllent.org/) and Postfix, which relays everything
+it accepts to Mailpit. Each message is sent, then read back through Mailpit's
+API and compared with what was sent. The tests cover:
+- every route: plaintext, STARTTLS and implicit TLS, with both TLS backends,
+  with and without authentication;
+- Unicode headers, bodies and addresses (SMTPUTF8), attachments, HTML with
+  inline images, dot-stuffing, long lines, Bcc and an 8 MB message;
+- Postfix's behaviour: BDAT and DATA, rejected recipients, relaying rules,
+  bad passwords, the SIZE limit, delivery status notifications, certificate
+  checks and a connection pool.
+
+The first run builds the Postfix image; after that a run takes about 15
+seconds. The servers keep running between runs; `make integration-down`
+stops them, and Mailpit's web page at <http://localhost:18025> shows what
+the tests sent. Without make, as on Windows:
+
+```sh
+docker compose -f integration/compose.yaml up -d --build --wait
+sbcl --eval '(asdf:test-system :smtp/integration)' --quit
+```
+
+The ports, all on localhost, are 11025 and 18025 for Mailpit and 10025,
+10587 and 10465 for Postfix; `SMTP_IT_HOST` and the other variables in
+`integration/package.lisp` point the tests elsewhere.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

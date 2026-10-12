@@ -1,0 +1,33 @@
+# Real SMTP servers for the integration tests (make integration).
+#   docker compose -f integration/compose.yaml up -d --build --wait
+# Ports are published on localhost only. Mailpit's web UI, at
+# http://localhost:18025, shows everything the tests sent.
+name: smtp-integration
+
+services:
+  mailpit:
+    image: axllent/mailpit:v1.31.2
+    environment:
+      MP_SMTP_TLS_CERT: /certs/server-chain.pem
+      MP_SMTP_TLS_KEY: /certs/server-key.pem
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_SMTP_DISABLE_RDNS: "true"
+      MP_MAX_MESSAGES: "5000"
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "127.0.0.1:11025:1025"
+      - "127.0.0.1:18025:8025"
+
+  postfix:
+    build: ./postfix
+    depends_on:
+      mailpit:
+        condition: service_healthy
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "127.0.0.1:10025:25"
+      - "127.0.0.1:10587:587"
+      - "127.0.0.1:10465:465"
