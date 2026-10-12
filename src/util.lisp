@@ -65,8 +65,10 @@
   (every (lambda (c) (< (char-code c) 128)) string))
 
 (defun control-char-p (char)
+  "Whether CHAR is a C0 or C1 control character, DEL, or one of the Unicode
+line and paragraph separators, which some readers also take as line breaks."
   (let ((code (char-code char)))
-    (or (< code 32) (= code 127))))
+    (or (< code 32) (<= 127 code 159) (= code #x2028) (= code #x2029))))
 
 (defun line-break-char-p (char)
   (or (char= char #\Return) (char= char #\Linefeed)))

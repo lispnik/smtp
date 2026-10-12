@@ -24,11 +24,23 @@
   (print-unreadable-object (a stream :type t)
     (format stream "~s ~a" (attachment-filename a) (attachment-content-type a))))
 
+(defun %invisible-char-p (char)
+  "Whether CHAR changes how a name displays without being seen: the bidi
+controls, which can make \"invoice<U+202E>fdp.exe\" display as
+\"invoiceexe.pdf\", and the zero-width characters that are not needed to
+join letters (U+200C and U+200D are)."
+  (let ((code (char-code char)))
+    (or (= code #x061C) (= code #x200B) (= code #x200E) (= code #x200F)
+        (<= #x202A code #x202E) (= code #x2060) (<= #x2066 code #x2069) (= code #xFEFF))))
+
 (defun %sanitize-filename (name)
   (let* ((base (subseq name (1+ (or (position-if (lambda (c) (find c "/\\")) name :from-end t)
                                     -1))))
          ;; Readers drop surrounding spaces, and Windows trailing dots too.
-         (clean (string-right-trim ". " (string-trim '(#\Space #\Tab) (remove-if #'control-char-p base)))))
+         (clean (string-right-trim ". " (string-trim '(#\Space #\Tab)
+                                                     (remove-if (lambda (c) (or (control-char-p c)
+                                                                                (%invisible-char-p c)))
+                                                                base)))))
     (if (zerop (length clean)) "attachment" clean)))
 
 (defun %valid-parameters-p (string)

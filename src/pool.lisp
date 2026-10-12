@@ -147,23 +147,46 @@ CONNECTION was idle. Either way it cannot be used."
        (not (%in-transaction connection))
        (not (%readable-p connection))))
 
-(defun %release-slot (pool &optional (n 1))
+(defun %release-slot (pool)
+  "Give up one slot, waking one waiting thread to take it."
   (bt2:with-lock-held ((%pool-lock pool))
-    (decf (%pool-size pool) n)
-    (bt2:condition-broadcast (%pool-available pool))))
+    (decf (%pool-size pool))
+    (bt2:condition-notify (%pool-available pool))))
 
-(defun %retire (pool entries)
-  "Close ENTRIES, then give up their slots. Called without the lock held."
-  (when entries
-    (dolist (entry entries)
-      (close-connection (%pooled-connection entry)))
-    (%release-slot pool (length entries))))
+(defun %close-entry (entry wait)
+  "Close ENTRY's connection with QUIT, waiting for the reply only if WAIT."
+  (let ((connection (%pooled-connection entry)))
+    (if wait
+        (close-connection connection)
+        (progn
+          (when (eq (connection-state connection) :open)
+            (ignore-errors (send-command connection "QUIT")))
+          (close-connection connection :quit nil)))))
+
+(defun %retire (pool entries &key (wait t))
+  "Close ENTRIES, giving up each one's slot once it is closed, or if closing
+it fails. Called without the lock held. Without WAIT, QUIT's reply is not
+awaited: an idle connection that expired has often been dropped by the
+server already, and waiting for it would hold up the thread asking for a
+connection."
+  (let ((open entries))
+    (unwind-protect
+         (loop while open
+               do (%close-entry (first open) wait)
+                  (pop open)
+                  (%release-slot pool))
+      ;; Only after a non-local exit: close the rest without QUIT.
+      (dolist (entry open)
+        (ignore-errors (close-connection (%pooled-connection entry) :quit nil))
+        (%release-slot pool)))))
 
 (defun %take (pool fresh deadline)
   "Under the lock, take an idle entry or reserve a slot for a new connection.
-Returns the entry, NIL to open a new one, or :RETIRE with idle entries to
-close first. Those keep their slots until they are closed, so the pool never
-has more than MAX-CONNECTIONS connections open, even briefly."
+Returns the entry, NIL to open a new one, :RETIRE with expired idle entries
+to close first, or :REPLACE with an idle entry to close and open a new
+connection in its slot. Entries keep their slots until they are closed, so
+the pool never has more than MAX-CONNECTIONS connections open, even
+briefly."
   (let ((lock (%pool-lock pool)))
     (bt2:with-lock-held (lock)
       (loop
@@ -181,9 +204,11 @@ has more than MAX-CONNECTIONS connections open, even briefly."
           (when (and fresh (null stale) (%pool-idle pool)
                      (>= (%pool-size pool) (%pool-max-connections pool)))
             ;; Make room by closing the least recently used idle connection.
+            ;; Its slot passes straight to the new one, so that a waiting
+            ;; thread cannot take it and leave this one to close another.
             (let ((oldest (car (last (%pool-idle pool)))))
               (setf (%pool-idle pool) (butlast (%pool-idle pool)))
-              (push oldest stale)))
+              (return-from %take (values :replace oldest))))
           (when stale
             (return-from %take (values :retire stale)))
           (when (< (%pool-size pool) (%pool-max-connections pool))
@@ -229,14 +254,18 @@ idle longer than the pool's CHECK-AFTER."
         (case entry
           (:closed (error 'smtp-pool-closed))
           (:timeout (error 'smtp-pool-timeout :seconds (%pool-wait-timeout pool)))
-          (:retire (%retire pool stale))
+          (:retire (%retire pool stale :wait nil))
+          (:replace (let ((ok nil))
+                      (unwind-protect (progn (%close-entry stale nil) (setf ok t))
+                        (unless ok (%release-slot pool))))
+                    (return (%open-entry pool)))
           ((nil) (return (%open-entry pool)))
           (t (if (%alive-p pool entry)
                  (progn (setf (%pooled-reused entry) t)
                         (bt2:with-lock-held ((%pool-lock pool))
                           (incf (%pool-reuses pool)))
                         (return entry))
-                 (%retire pool (list entry)))))))))
+                 (%retire pool (list entry) :wait nil))))))))
 
 (defun %checkin (pool entry)
   (let* ((connection (%pooled-connection entry))

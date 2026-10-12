@@ -261,18 +261,23 @@ error."
 
 ;;; Header folding (RFC 5322 section 2.2.3)
 
-(defun %fold-tokens (value)
+(defun %fold-tokens (value &key (quotes t))
   "Split VALUE into tokens at the whitespace before each run of non-space
-characters, ignoring whitespace inside quoted strings. Every token but the
-first begins with whitespace, so a line break may be put before any of them."
+characters, ignoring whitespace inside quoted strings unless QUOTES is
+false. Every token but the first begins with whitespace, so a line break may
+be put before any of them."
   (let ((tokens '()) (start 0) (in-quote nil) (escape nil) (n (length value)))
     (loop for i from 0 below n
           for c = (char value i)
-          do (cond (escape (setf escape nil))
+          do (cond ((not quotes))
+                   (escape (setf escape nil))
                    ((and in-quote (char= c #\\)) (setf escape t))
-                   ((char= c #\") (setf in-quote (not in-quote)))
-                   ((and (not in-quote) (wsp-char-p c) (> i start)
-                         (not (wsp-char-p (char value (1- i)))))
+                   ((char= c #\") (setf in-quote (not in-quote))))
+             (cond ((or escape in-quote))
+                   ((and (wsp-char-p c) (> i start)
+                         (not (wsp-char-p (char value (1- i))))
+                         ;; Never between a backslash and what it quotes.
+                         (char/= (char value (1- i)) #\\))
                     (push (subseq value start i) tokens)
                     (setf start i))))
     (push (subseq value start) tokens)
@@ -294,7 +299,13 @@ VALUE contains a line break."
   (let ((lines '())
         (line (format nil "~a:" name))
         (first t))
-    (dolist (token (%fold-tokens value))
+    (dolist (token (loop for token in (%fold-tokens value)
+                         ;; A quoted string too long for a line may be folded
+                         ;; inside (RFC 5322 allows FWS there), as must a run
+                         ;; after a stray quote in unstructured text.
+                         if (> (length token) (1- limit))
+                           append (%fold-tokens token :quotes nil)
+                         else collect token))
       (let ((piece (if (and first (plusp (length token)) (not (wsp-char-p (char token 0))))
                        (concatenate 'string " " token)
                        token)))

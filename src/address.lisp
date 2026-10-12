@@ -118,6 +118,9 @@ address literal such as \"[192.0.2.1]\"."
     (let ((raw-local (subseq spec 0 at))
           (domain (subseq spec (1+ at))))
       (when (zerop (length raw-local)) (%address-error original "empty local part"))
+      ;; Tabs are allowed around a display name, but SMTP's quoted local
+      ;; parts (RFC 5321 qtextSMTP) have no room for one.
+      (when (find #\Tab raw-local) (%address-error original "the local part contains a tab"))
       (when (zerop (length domain)) (%address-error original "empty domain"))
       (let ((local (cond ((%quoted-p raw-local) (%unquote raw-local original))
                          ((%dot-atom-p raw-local) raw-local)

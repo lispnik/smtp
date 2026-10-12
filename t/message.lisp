@@ -398,3 +398,41 @@ m = email.message_from_bytes(sys.stdin.buffer.read())
 d = lambda h: str(make_header(decode_header(m[h])))
 sys.stdout.buffer.write((d('From') + '|' + d('Subject')).encode())")
                    :input (make-string-input-stream text) :output :string :external-format :utf-8))))))
+
+(test invisible-characters-leave-filenames
+  (flet ((name (n) (attachment-filename (make-attachment (octets "x") :filename n))))
+    (is (string= "invoicefdp.exe" (name (format nil "invoice~cfdp.exe" (code-char #x202E)))))
+    (is (string= "ab.txt" (name (format nil "a~c~cb.txt~c" (code-char #x200B) (code-char #x2066)
+                                        (code-char #x0085)))))
+    ;; Joiners are part of some scripts and emoji.
+    (let ((joined (format nil "~c~c~c.png" (code-char #x1F469) (code-char #x200D) (code-char #x1F4BB))))
+      (is (string= joined (name joined))))))
+
+(test unicode-line-breaks-are-refused-in-headers
+  (dolist (c (list (code-char #x85) (code-char #x2028) (code-char #x2029)))
+    (signals error (make-message :from "alice@example.com" :to "bob@example.org"
+                                 :subject (format nil "a~cb" c) :text "hi"))
+    (signals invalid-address (make-mailbox "ann@example.com" (format nil "Ann~cLee" c)))
+    (signals invalid-header (smtp::encode-unstructured (format nil "a~cb" c) :utf8 t))))
+
+(test tabs-are-refused-in-local-parts
+  (signals invalid-address (parse-mailbox (format nil "\"a~cb\"@example.com" #\Tab)))
+  (signals invalid-address (make-mailbox (format nil "\"a~cb\"@example.com" #\Tab)))
+  (is (string= "\"a b\"@example.com" (mailbox-address (make-mailbox "\"a b\"@example.com")))))
+
+(test long-quoted-text-is-folded
+  ;; A display name too long for one line, and a Subject with a stray quote
+  ;; before a long run of words, are folded inside the quotes.
+  (let* ((words (format nil "~{~a~^ ~}" (make-list 200 :initial-element "Smith,")))
+         (subject (format nil "\"~a" words))
+         (text (render (make-message :from (make-mailbox "alice@example.com" words)
+                                     :to "bob@example.org" :subject subject :text "hi"))))
+    (is (every (lambda (l) (<= (length l) 78)) (lines-of text)))
+    (when (python-available-p)
+      (is (string= (format nil "~a|~a" words subject)
+                   (uiop:run-program
+                    (list "python3" "-I" "-c" "import email,sys
+from email import policy
+m = email.message_from_string(sys.stdin.read(), policy=policy.default)
+sys.stdout.write(m['From'].addresses[0].display_name + '|' + str(m['Subject']))")
+                    :input (make-string-input-stream text) :output :string))))))

@@ -443,3 +443,57 @@ a reply line."
       (dotimes (i 2)
         (signals smtp-authentication-failed (pool-send-message pool (simple-message))))
       (is (= 0 (stat pool :connections))))))
+
+(test failing-close-frees-the-slot
+  ;; Something other than an SMTP error escapes while a retired connection
+  ;; is closed: its slot must still be given back.
+  (with-pool-server (port server (scripted-server))
+    (with-pool (pool port :max-connections 1 :max-messages-per-connection 1 :wait-timeout 0.5
+                          :trace (lambda (direction line)
+                                   (when (and (eq direction :client) (string= line "QUIT"))
+                                     (error "trace failed"))))
+      (signals simple-error (pool-send-message pool (simple-message)))
+      (is (= 0 (stat pool :connections)))
+      (signals simple-error (pool-send-message pool (simple-message)))
+      (is (= 2 (stat pool :opened))))
+    (is (= 2 (server-message-count server)))))
+
+(test expired-idle-connections-close-quickly
+  ;; A server that has silently dropped an idle connection never answers
+  ;; QUIT; the thread wanting a connection does not wait for it.
+  (with-pool-server (port server
+                     (lambda (s index)
+                       (declare (ignore index))
+                       (srv-send s "220 silent.test ESMTP")
+                       (loop for line = (srv-read-line s)
+                             while line
+                             do (let ((verb (%verb line)))
+                                  (cond ((string= verb "QUIT") (sleep 1.5) (return))
+                                        ((string= verb "DATA")
+                                         (srv-send s "354 go")
+                                         (srv-read-data s)
+                                         (srv-send s "250 queued"))
+                                        (t (srv-send s "250 ok")))))))
+    (with-pool (pool port :idle-timeout 0.1)
+      (pool-send-message pool (simple-message))
+      (sleep 0.2)
+      (let ((start (get-internal-real-time)))
+        (pool-send-message pool (simple-message))
+        (is (< (/ (- (get-internal-real-time) start) internal-time-units-per-second) 1)))
+      (is (= 2 (stat pool :opened))))
+    (is (sent-commands (first (server-session-list server)) "QUIT"))))
+
+(test fresh-checkout-replaces-one-idle-connection
+  ;; A fresh connection wanted while the pool is full of idle ones takes the
+  ;; slot of the least recently used, which is closed.
+  (with-pool-server (port server (scripted-server))
+    (with-pool (pool port :max-connections 1)
+      (pool-send-message pool (simple-message))
+      (let ((entry (smtp::%checkout pool :fresh t)))
+        (is (= 1 (stat pool :connections)))
+        (is (= 0 (stat pool :idle)))
+        (is (= 2 (stat pool :opened)))
+        (smtp::%checkin pool entry))
+      (is (= 1 (stat pool :idle))))
+    (is (= 2 (length (server-session-list server))))
+    (is (sent-commands (first (server-session-list server)) "QUIT"))))
