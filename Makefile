@@ -26,7 +26,7 @@ integration-run:
 	$(LISP) --eval '(asdf:test-system :smtp/integration)'
 
 integration-up:
-	$(COMPOSE) up -d --build --wait --quiet-build --quiet-pull
+	$(COMPOSE) up -d --build --wait --quiet-pull
 
 integration-down:
 	$(COMPOSE) down
