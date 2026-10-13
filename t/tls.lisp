@@ -199,3 +199,79 @@
   (signals smtp-tls-error (open-connection "127.0.0.1" :port 1 :tls-backend :bogus))
   (finishes (handler-case (open-connection "127.0.0.1" :port 1 :tls :none :tls-backend :bogus)
               (smtp-connection-error () t))))
+
+;;; What the ClientHello carries
+
+(defun %parse-client-hello-server-name (record)
+  "The host name in the server_name extension (RFC 6066 section 3) of the
+TLS RECORD holding a ClientHello, or NIL if it has none."
+  (let ((i 0))
+    (flet ((u8 () (prog1 (aref record i) (incf i)))
+           (u16 () (prog1 (+ (ash (aref record i) 8) (aref record (1+ i))) (incf i 2))))
+      (assert (= 22 (u8)))                ; handshake record
+      (incf i 4)                          ; version, length
+      (assert (= 1 (u8)))                 ; ClientHello
+      (incf i (+ 3 2 32))                 ; length, version, random
+      (incf i (u8))                       ; session id
+      (incf i (u16))                      ; cipher suites
+      (incf i (u8))                       ; compression methods
+      (let ((end (+ (u16) i)))
+        (loop while (< i end)
+              do (let* ((type (u16)) (length (u16)) (next (+ i length)))
+                   (when (= type 0)
+                     ;; server_name_list: length, then name_type 0, length, name.
+                     (incf i 2)
+                     (assert (= 0 (u8)))
+                     (let ((n (u16)))
+                       (return-from %parse-client-hello-server-name
+                         (map 'string #'code-char (subseq record i (+ i n))))))
+                   (setf i next)))
+        nil))))
+
+(defun client-hello-server-name (connect)
+  "Call CONNECT with the port of a server that reads one ClientHello and
+hangs up. Returns the SNI host name it carried (NIL if none) and whether a
+ClientHello arrived at all."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0 :reuse-address t
+                                                        :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (hello nil)
+         (thread (bt:make-thread
+                  (lambda ()
+                    (when (usocket:wait-for-input listener :timeout 10 :ready-only t)
+                      (let* ((socket (usocket:socket-accept listener))
+                             (s (usocket:socket-stream socket)))
+                        (unwind-protect
+                             (let ((header (make-array 5 :element-type '(unsigned-byte 8))))
+                               (read-sequence header s)
+                               (let ((record (make-array (+ 5 (+ (ash (aref header 3) 8) (aref header 4)))
+                                                         :element-type '(unsigned-byte 8))))
+                                 (replace record header)
+                                 (read-sequence record s :start 5)
+                                 (setf hello record)))
+                          (usocket:socket-close socket)))))
+                  :name "client hello reader")))
+    (unwind-protect (ignore-errors (funcall connect port))
+      (bt:join-thread thread)
+      (usocket:socket-close listener))
+    (if hello
+        (values (%parse-client-hello-server-name hello) t)
+        (values nil nil))))
+
+(def-tls-test no-sni-for-ip-addresses
+  ;; RFC 6066 section 3: "Literal IPv4 and IPv6 addresses are not permitted
+  ;; in HostName". The certificate is still checked against the address
+  ;; (IP-ADDRESSES-ARE-VERIFIED).
+  (flet ((sni (&rest options)
+           (client-hello-server-name
+            (lambda (port)
+              (apply #'open-connection "127.0.0.1" :port port :tls :implicit :verify nil
+                     :local-name "client.test" :timeout 5 options)))))
+    (multiple-value-bind (name hello) (sni)
+      (is-true hello)
+      (is (null name) "~s was sent as SNI" name))
+    (multiple-value-bind (name hello) (sni :tls-hostname "192.0.2.1")
+      (is-true hello)
+      (is (null name) "~s was sent as SNI" name))
+    ;; A name is sent, which shows the parsing works.
+    (is (equal "mx.example.test" (sni :tls-hostname "mx.example.test")))))
