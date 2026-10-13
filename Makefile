@@ -11,7 +11,8 @@ LISP = $(SBCL) --noinform --non-interactive --eval '(asdf:initialize-source-regi
 test:
 	$(LISP) --eval '(asdf:test-system :smtp)'
 
-# Load, concurrency and fuzz tests (several minutes; STRESS=section,... to pick).
+# Load, concurrency and fuzz tests (several minutes; STRESS=section,... to pick,
+# SEED=n to replay the fuzzing of an earlier run).
 stress:
 	$(SBCL) --dynamic-space-size 4096 --noinform --non-interactive --load tools/stress.lisp
 

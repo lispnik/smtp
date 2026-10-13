@@ -4,6 +4,8 @@
 ;;; queue. Not part of make test; run with make stress, or from the checkout:
 ;;;   sbcl --dynamic-space-size 4096 --non-interactive --load tools/stress.lisp
 ;;; Sections can be chosen with STRESS=throughput,pool,... (default all).
+;;; The fuzzing sections draw from a random seed printed at the start; SEED=n
+;;; replays a run.
 
 (asdf:initialize-source-registry
  `(:source-registry (:directory ,(uiop:getcwd)) (:tree ,(merge-pathnames "ocicl/" (uiop:getcwd)))
@@ -25,6 +27,17 @@
        (let ((elapsed (- (now) start)))
          (format t "~&  ~a: ~,2fs~@[, ~,1f/s~]~%" ,label elapsed
                  (and (> ,count 1) (plusp elapsed) (/ ,count elapsed)))))))
+
+(defvar *seed*
+  (let ((s (uiop:getenv "SEED")))
+    (if (plusp (length s))
+        (parse-integer s)
+        (random 1000000 (make-random-state t)))))
+(format t "~&== Seed ~d (SEED=~:*~d replays this run)~%" *seed*)
+
+(defun fuzz-seed (base i)
+  ;; Independent seeds per section and iteration, all derived from *seed*.
+  (+ (* *seed* 10000000) base i))
 
 (defun section-p (name)
   (let ((only (uiop:getenv "STRESS")))
@@ -160,7 +173,7 @@
 (defun hostile-handler (seed)
   (lambda (s &optional index)
     (declare (ignore index))
-    (let ((rng (sb-ext:seed-random-state seed))
+    (let ((rng (sb-ext:seed-random-state (fuzz-seed 0 seed)))
           (stream (session-stream s)))
       (flet ((send (line) (write-sequence (octets line) stream) (write-sequence #(13 10) stream) (force-output stream))
              (raw (n) (write-sequence (let ((v (make-array n :element-type '(unsigned-byte 8))))
@@ -265,7 +278,7 @@
     (push dir *cleanup*)
     (timed ("render" n)
       (dotimes (seed n)
-        (let ((rng (sb-ext:seed-random-state (+ 100000 seed))))
+        (let ((rng (sb-ext:seed-random-state (fuzz-seed 100000 seed))))
           (handler-case
               (let* ((m (random-message rng))
                      (octets (render-message m)))
@@ -353,7 +366,7 @@ print('python checked', 'bad', bad)
                  (list (cons :mx (%dns-response zone (smtp/delivery::%make-query 7 "example.test" :mx)))
                        (cons :txt (%dns-response zone (smtp/delivery::%make-query 7 "example.test" :txt)))
                        (cons :tlsa (%dns-response zone (smtp/delivery::%make-query 7 "_25._tcp.mx1.example.test" :tlsa))))))
-         (rng (sb-ext:seed-random-state 42)) (outcomes (make-hash-table)))
+         (rng (sb-ext:seed-random-state (fuzz-seed 200000 0))) (outcomes (make-hash-table)))
     (timed ("parse" 200000)
       (dotimes (i 200000)
         (destructuring-bind (type . octets) (random-elt rng good)
@@ -402,4 +415,5 @@ print('python checked', 'bad', bad)
 
 (mapc (lambda (dir) (uiop:delete-directory-tree dir :validate t)) *cleanup*)
 (format t "~&~%== ~d finding~:p~%~{  - ~a~%~}" (length *findings*) (reverse *findings*))
+(when *findings* (format t "~&  Replay with SEED=~d~%" *seed*))
 (uiop:quit (if *findings* 1 0))
