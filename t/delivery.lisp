@@ -830,3 +830,67 @@
                           (declare (ignore host address))
                           (error "no port configured")))))
     (is (equal '((:failed) "Gave up after 2 attempts" (:failed)) (give-up #'refused)))))
+
+(test queue-local-error-defers-only-its-domain
+  ;; bob is delivered, then carol's domain fails locally: retries must not
+  ;; send bob the message again.
+  (let ((zone (example-zone)))
+    (zone-add zone "other.test" :a "127.0.0.1")
+    (with-mock-dns (r zone)
+      (with-pool-server (p server (let ((h (standard-server)))
+                                    (lambda (s &optional i) (declare (ignore i)) (funcall h s))))
+        (let* ((delivered '())
+               (queue (d:make-delivery-queue :resolver r :local-name "client.test" :mta-sts nil
+                                             :timeout 5 :connect-timeout 5 :retry-schedule '(60)
+                                             :port (lambda (host address)
+                                                     (declare (ignore address))
+                                                     (if (string= host "other.test") (error "boom") p))
+                                             :on-delivered (lambda (item statuses)
+                                                             (declare (ignore item))
+                                                             (setf delivered (append delivered statuses)))))
+               (item (d:enqueue-message queue (simple-message :to "bob@example.test" :cc "carol@other.test")
+                                        :now 0)))
+          (handler-bind ((warning #'muffle-warning))
+            (d:run-delivery-queue queue :now 0)
+            (d:run-delivery-queue queue :now 60))
+          (is (= 1 (server-message-count server)))
+          (is (equal '("bob@example.test") (mapcar #'d:recipient-status-recipient delivered)))
+          (is (equal '("carol@other.test") (d:queued-message-recipients item))))))))
+
+(test queue-rejects-bad-settings
+  (signals type-error (d:make-delivery-queue :retry-schedule '()))
+  (signals type-error (d:make-delivery-queue :retry-schedule '(60 nil)))
+  (signals type-error (d:make-delivery-queue :give-up-after nil))
+  (let ((queue (d:make-delivery-queue)))
+    (signals smtp:mail-format-error
+      (d:enqueue-raw-message queue (crlf "Subject: x" "" "x") :envelope-from "a@example.test"))
+    (signals smtp:mail-format-error
+      (d:enqueue-raw-message queue (crlf "Subject: x" "" "x") :recipients '("b@example.test")))
+    (is (null (d:delivery-queue-messages queue)))))
+
+(test queue-restores-saved-messages
+  ;; A message saved from one queue and put back in another keeps its age
+  ;; and attempts, and so gives up on time.
+  (with-mock-dns (r (example-zone))
+    (let* ((failed '())
+           (old (d:make-delivery-queue :resolver r :local-name "client.test" :mta-sts nil
+                                       :connect-timeout 5 :port #'refused))
+           (new (d:make-delivery-queue :resolver r :local-name "client.test" :mta-sts nil
+                                       :connect-timeout 5 :port #'refused :give-up-after 3600
+                                       :on-failed (lambda (item statuses)
+                                                    (declare (ignore item))
+                                                    (setf failed statuses)))))
+      (d:enqueue-message old (simple-message :to "bob@example.test") :now 0)
+      (d:run-delivery-queue old :now 0)
+      (let ((saved (first (d:delivery-queue-messages old))))
+        (d:enqueue-raw-message new (d:queued-message-octets saved)
+                               :envelope-from (d:queued-message-envelope-from saved)
+                               :recipients (d:queued-message-recipients saved)
+                               :smtputf8 (d:queued-message-smtputf8 saved)
+                               :id (d:queued-message-id saved)
+                               :queued-at (d:queued-message-queued-at saved)
+                               :attempts (d:queued-message-attempts saved)
+                               :now 7200))
+      (d:run-delivery-queue new :now 7200)
+      (is (equal '(:failed) (mapcar #'d:recipient-status-status failed)))
+      (is (search "Gave up after 2 attempts" (d:recipient-status-message (first failed)))))))

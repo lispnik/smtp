@@ -58,6 +58,10 @@ DANE, MTA-STS and a retry queue.")
    #:delivery-queue-messages
    #:queued-message
    #:queued-message-id
+   #:queued-message-octets
+   #:queued-message-envelope-from
+   #:queued-message-smtputf8
+   #:queued-message-queued-at
    #:queued-message-recipients
    #:queued-message-attempts
    #:queued-message-next-attempt

@@ -45,6 +45,9 @@ message is queued its outstanding recipients fail. ON-DELIVERED, ON-FAILED
 and ON-DEFERRED are called with the QUEUED-MESSAGE and the recipient
 statuses of an attempt in that state, so that the application can, for
 example, send a bounce for failed recipients."
+  (unless (and retry-schedule (every (lambda (n) (typep n '(real 0))) retry-schedule))
+    (error 'type-error :datum retry-schedule :expected-type '(cons (real 0) list)))
+  (check-type give-up-after (real 0))
   (make-instance 'delivery-queue
                  :retry-schedule retry-schedule :give-up-after give-up-after
                  :on-delivered on-delivered :on-failed on-failed :on-deferred on-deferred
@@ -63,13 +66,17 @@ Returns the QUEUED-MESSAGE."
                          :smtputf8 utf8 :id (message-id message) :now now)))
 
 (defun enqueue-raw-message (queue octets &key envelope-from recipients smtputf8 id
-                                           (now (get-universal-time)))
-  "Queue the rendered OCTETS for delivery now."
+                                           (now (get-universal-time)) (queued-at now) (attempts 0))
+  "Queue the rendered OCTETS for delivery now. QUEUED-AT and ATTEMPTS restore
+a message saved from an earlier queue, so that it still gives up on time."
+  (unless envelope-from (error 'mail-format-error :message "No envelope sender (:envelope-from)"))
+  (unless recipients (error 'mail-format-error :message "No recipients"))
   (let ((item (%make-queued-message
                :id (or id (smtp::random-token 12)) :octets octets
                :envelope-from (if (equal envelope-from "") "" (mailbox-address (smtp::ensure-mailbox envelope-from)))
-               :recipients (mapcar #'mailbox-address (smtp::ensure-mailbox-list recipients))
-               :smtputf8 smtputf8 :queued-at now :next-attempt now)))
+               :recipients (remove-duplicates (mapcar #'mailbox-address (smtp::ensure-mailbox-list recipients))
+                                              :test #'string-equal :from-end t)
+               :smtputf8 smtputf8 :queued-at queued-at :attempts attempts :next-attempt now)))
     (bt:with-lock-held ((%queue-lock queue))
       (setf (%items queue) (append (%items queue) (list item))))
     item))
@@ -124,22 +131,41 @@ delivered, failed and deferred, for the callbacks."
         (setf (%items queue) (remove item (%items queue))))
       (values delivered failed deferred))))
 
+(defun %deliver-item (queue item)
+  "Deliver ITEM one recipient domain at a time, so that a local error for one
+domain defers only its recipients and not those already delivered to
+others. Returns the statuses and the errors."
+  (let ((recipients (queued-message-recipients item)) (statuses '()) (errors '()))
+    (dolist (domain (remove-duplicates (mapcar #'%recipient-domain recipients)
+                                       :test #'string= :from-end t))
+      (let ((group (remove domain recipients :key #'%recipient-domain :test-not #'string=)))
+        (setf statuses
+              (append statuses
+                      (handler-case (apply #'deliver-raw-message (queued-message-octets item)
+                                           :envelope-from (queued-message-envelope-from item)
+                                           :recipients group
+                                           :smtputf8 (queued-message-smtputf8 item)
+                                           (delivery-queue-options queue))
+                        ;; A bug or a local problem: try these recipients later.
+                        (error (e)
+                          (push e errors)
+                          (let ((message (format nil "~a" e)))
+                            (mapcar (lambda (r) (%status r :deferred :message message)) group))))))))
+    (values statuses (nreverse errors))))
+
 (defun %process-item (queue item now)
   "Attempt ITEM and record the outcome. Returns the callbacks to make, as a
-list of (function statuses)."
-  (let ((statuses (apply #'deliver-raw-message (queued-message-octets item)
-                         :envelope-from (queued-message-envelope-from item)
-                         :recipients (queued-message-recipients item)
-                         :smtputf8 (queued-message-smtputf8 item)
-                         (delivery-queue-options queue))))
+list of (function statuses), and the local errors met."
+  (multiple-value-bind (statuses errors) (%deliver-item queue item)
     (flet ((with-status (status)
              (remove status statuses :key #'recipient-status-status :test-not #'eq)))
       (multiple-value-bind (delivered failed deferred)
           (%record-attempt queue item now
                            (with-status :delivered) (with-status :failed) (with-status :deferred))
-        (list (list (%on-delivered queue) delivered)
-              (list (%on-failed queue) failed)
-              (list (%on-deferred queue) deferred))))))
+        (values (list (list (%on-delivered queue) delivered)
+                      (list (%on-failed queue) failed)
+                      (list (%on-deferred queue) deferred))
+                errors)))))
 
 (defun %attempt-failed (queue item now condition)
   "Record an attempt that failed with CONDITION, a local problem rather than
@@ -167,14 +193,15 @@ make, as %PROCESS-ITEM does."
                   due))))
     (unwind-protect
          (dolist (item due)
-           (let ((callbacks
-                   (handler-case (%process-item queue item now)
-                     ;; A bug or a local problem: keep the message and try
-                     ;; later, unless it has been queued too long.
-                     (error (e)
-                       (prog1 (%attempt-failed queue item now e)
-                         (warn "Delivery of ~a failed: ~a" (queued-message-id item) e))))))
+           (multiple-value-bind (callbacks errors)
+               (handler-case (%process-item queue item now)
+                 ;; A bug or a local problem: keep the message and try
+                 ;; later, unless it has been queued too long.
+                 (error (e) (values (%attempt-failed queue item now e) (list e))))
              (setf claimed (remove item claimed :key #'car))
+             ;; Warned only now that the attempt is recorded.
+             (dolist (e errors)
+               (warn "Delivery of ~a failed: ~a" (queued-message-id item) e))
              (loop for (fn statuses) in callbacks
                    do (%notify fn item statuses))))
       ;; Unwound part way (a warning made an error, say): release the

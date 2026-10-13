@@ -385,9 +385,11 @@ domain.
 ## Scope and limitations
 
 - The delivery queue is in memory: keep `delivery-queue-messages` somewhere
-  durable if queued mail must survive a restart. Bounces (DSNs) for failed
-  recipients are left to the `:on-failed` callback, and TLSRPT reports
-  (RFC 8460) are not sent.
+  durable if queued mail must survive a restart (their octets, envelope,
+  recipients, queued-at time and attempts), and put them back with
+  `enqueue-raw-message`'s `:queued-at` and `:attempts`. Bounces (DSNs) for
+  failed recipients are left to the `:on-failed` callback, and TLSRPT
+  reports (RFC 8460) are not sent.
 - Timeouts rely on SBCL's deadlines; the library is developed and tested on
   SBCL. On other implementations it works but I/O is not time-limited.
 - The test certificates are backdated to 2019 with a hundred-year lifetime:
@@ -438,7 +440,8 @@ installed.
 - 200,000 corrupted DNS responses;
 - a delivery queue run from several threads at once.
 
-Pick sections with `STRESS=pool,messages make stress`.
+Pick sections with `STRESS=pool,messages make stress`. Each run fuzzes with a new
+random seed, which it prints; `SEED=n make stress` replays that run.
 
 `make integration` tests against real servers running in Docker:
 - [Mailpit](https://mailpit.axllent.org/), which keeps what it receives;
