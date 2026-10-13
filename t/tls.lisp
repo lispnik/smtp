@@ -238,7 +238,7 @@ ClientHello arrived at all."
          (hello nil)
          (thread (bt:make-thread
                   (lambda ()
-                    (when (usocket:wait-for-input listener :timeout 10 :ready-only t)
+                    (when (wait-for-connection listener 10)
                       (let* ((socket (usocket:socket-accept listener))
                              (s (usocket:socket-stream socket)))
                         (unwind-protect

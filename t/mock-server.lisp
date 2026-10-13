@@ -97,6 +97,18 @@ the receiving MTA would. Returns octets with CRLF line endings."
 (defun srv-input-pending-p (session)
   (handler-case (listen (session-stream session)) (error () nil)))
 
+(defun wait-for-connection (listener timeout)
+  "Whether a connection arrives at LISTENER within TIMEOUT seconds. A single
+USOCKET:WAIT-FOR-INPUT is not enough: on SBCL it returns as if timed out
+when select() is interrupted, as it is by every garbage collection on
+Linux, and the client would be left waiting for a greeting."
+  (let ((deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
+    (loop
+      (let ((left (/ (- deadline (get-internal-real-time)) internal-time-units-per-second)))
+        (when (<= left 0) (return nil))
+        (when (usocket:wait-for-input listener :timeout left :ready-only t)
+          (return t))))))
+
 (defun call-with-mock-server (handler function &key implicit-tls (timeout 15))
   "Run HANDLER on a session for one client connection while FUNCTION is called
 with the port and the session."
@@ -111,7 +123,7 @@ with the port and the session."
               (let ((*server-certificate* certificate) (*server-key* key) (*server-chain* chain))
               (handler-case
                   (sb-sys:with-deadline (:seconds timeout)
-                    (when (usocket:wait-for-input listener :timeout timeout :ready-only t)
+                    (when (wait-for-connection listener timeout)
                       (let ((socket (usocket:socket-accept listener)))
                         (setf (session-socket session) socket
                               (session-stream session) (usocket:socket-stream socket))
