@@ -205,7 +205,8 @@
 (defun deliver (resolver ports &rest options)
   (apply #'d:deliver-message (simple-message :to "bob@example.test")
          :resolver resolver :port ports :local-name "client.test"
-         :connect-timeout 5 :timeout 5
+         ;; Generous: a loaded CI runner has timed out at 5 seconds.
+         :connect-timeout 20 :timeout 20
          :mta-sts-cache (make-instance 'd:mta-sts-cache)
          options))
 
@@ -775,3 +776,57 @@
       (is (equal '(:failed) (mapcar #'d:recipient-status-status failed)))
       (is (search "no port configured" (d:recipient-status-message (first failed))))
       (is (null (d:delivery-queue-messages queue))))))
+
+(test failed-address-lookup-without-tlsa-still-delivers
+  ;; A signed zone with no TLSA records: DANE does not apply, so a failed
+  ;; AAAA lookup is no reason to pass the host over.
+  (let ((zone (dane-zone)))
+    (push '("mx1.example.test" . :aaaa) (zone-failing zone))
+    (with-mock-dns (r zone)
+      (with-mock-server (port s (standard-server))
+        (let ((bob (first (deliver r (ports :mx1 port)))))
+          (is (eq :delivered (d:recipient-status-status bob)) "~a" (d:recipient-status-message bob))
+          (is (string= "mx1.example.test" (d:recipient-status-host bob))))))))
+
+(test queue-survives-warnings-as-errors
+  ;; An application that turns warnings into errors: the item that failed
+  ;; is still rescheduled, and the others claimed with it are released.
+  (with-mock-dns (r (example-zone))
+    (let* ((queue (d:make-delivery-queue :resolver r :local-name "client.test" :mta-sts nil
+                                         :timeout 5 :connect-timeout 5 :retry-schedule '(60)
+                                         :port (lambda (host address)
+                                                 (declare (ignore host address))
+                                                 (error "no port configured"))))
+           (a (d:enqueue-message queue (simple-message :to "bob@example.test") :now 0))
+           (b (d:enqueue-message queue (simple-message :to "bob@example.test") :now 0)))
+      (ignore-errors
+       (handler-bind ((warning (lambda (w) (error "warnings are errors: ~a" w))))
+         (d:run-delivery-queue queue :now 0)))
+      (is (= 60 (d:queued-message-next-attempt a)))
+      (is (<= (d:queued-message-next-attempt b) 60))
+      (is (= 2 (length (d:delivery-queue-messages queue)))))))
+
+(test queue-expiry-is-reported-alike
+  ;; Whether the last attempt was deferred or failed locally, giving up
+  ;; reports the same way.
+  (flet ((give-up (port)
+           (with-mock-dns (r (example-zone))
+             (let* ((failed '())
+                    (queue (d:make-delivery-queue :resolver r :local-name "client.test" :mta-sts nil
+                                                  :timeout 5 :connect-timeout 5 :give-up-after 3600
+                                                  :port port
+                                                  :on-failed (lambda (item statuses)
+                                                               (declare (ignore item))
+                                                               (setf failed statuses))))
+                    (item (d:enqueue-message queue (simple-message :to "bob@example.test") :now 0)))
+               (handler-bind ((warning #'muffle-warning))
+                 (d:run-delivery-queue queue :now 0)
+                 (d:run-delivery-queue queue :now 7200))
+               (list (mapcar #'d:recipient-status-status failed)
+                     (subseq (d:recipient-status-message (first failed)) 0 24)
+                     (mapcar #'d:recipient-status-status (d:queued-message-statuses item)))))))
+    (is (equal (give-up #'refused)
+               (give-up (lambda (host address)
+                          (declare (ignore host address))
+                          (error "no port configured")))))
+    (is (equal '((:failed) "Gave up after 2 attempts" (:failed)) (give-up #'refused)))))

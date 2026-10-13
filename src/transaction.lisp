@@ -111,9 +111,10 @@ can fill the buffers both ways and deadlock with it (RFC 2920 section 3.1).")
   "Send MAIL and RCPT COMMANDS, pipelined when the server allows it, and
 return their replies. A failed MAIL is signalled at once."
   (if (nth-value 1 (connection-extension connection "PIPELINING"))
-      (let ((replies '()))
-        (loop for start from 0 below (length commands) by *pipelining-batch*
-              for batch = (subseq commands start (min (length commands) (+ start *pipelining-batch*)))
+      (let ((replies '()) (size *pipelining-batch*))
+        (check-type size (integer 1) "a positive number of commands")
+        (loop for start from 0 below (length commands) by size
+              for batch = (subseq commands start (min (length commands) (+ start size)))
               do (%send-commands connection batch)
                  (dolist (line batch)
                    (let ((reply (read-reply connection)))
@@ -122,7 +123,8 @@ return their replies. A failed MAIL is signalled at once."
                      (when (= (reply-code reply) 421)
                        (check-reply connection reply line '(2)))))
                  ;; A refused MAIL: the remaining RCPTs would fail too.
-                 (check-reply connection (car (last replies)) (first commands) '(2)))
+                 (when (zerop start)
+                   (check-reply connection (car (last replies)) (first commands) '(2))))
         (nreverse replies))
       (let ((mail (command connection (first commands))))
         (cons mail

@@ -442,3 +442,23 @@ sys.stdout.write(m['From'].addresses[0].display_name + '|' + str(m['Subject']))"
     (dolist (code '(#x00AD #x034F #x115F #x180E #x2062 #x206A #x3164 #xFFA0 #xFFF9 #xE0041))
       (is (string= "report.pdf.exe" (name (format nil "report.p~cdf.exe" (code-char code))))
           "U+~4,'0x was kept" code))))
+
+(test address-literal-senders-can-be-rendered-again
+  ;; The generated Message-ID's right side is a domain literal, which
+  ;; RFC 5322 allows (no-fold-literal).
+  (let ((m (make-message :from "u@[192.0.2.1]" :to "bob@example.org" :subject "x" :text "y")))
+    (render m)
+    (finishes (render m))
+    (is (search "@[192.0.2.1]>" (message-id m))))
+  (finishes (make-message :from "alice@example.com" :to "bob@example.org" :subject "x" :text "y"
+                          :in-reply-to "<a@[192.0.2.1]>" :references "<b@[IPv6:2001:db8::1]>"))
+  (signals invalid-header (make-message :from "alice@example.com" :to "bob@example.org" :text "y"
+                                        :in-reply-to "<a[1]@example.com>"))
+  (signals invalid-header (make-message :from "alice@example.com" :to "bob@example.org" :text "y"
+                                        :in-reply-to "<a@[1\\]>")))
+
+(test list-unsubscribe-cannot-be-duplicated
+  (dolist (name '("List-Unsubscribe" "List-Unsubscribe-Post"))
+    (signals invalid-header (make-message :from "alice@example.com" :to "bob@example.org" :text "y"
+                                          :list-unsubscribe "https://example.com/u"
+                                          :headers (list (cons name "<https://evil.test/u>"))))))

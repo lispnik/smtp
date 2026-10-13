@@ -91,83 +91,97 @@ callbacks, or have the item retried."
       (error (e)
         (warn "A delivery queue callback failed for ~a: ~a" (queued-message-id item) e)))))
 
+(defun %give-up (statuses attempts)
+  "STATUSES, for recipients still outstanding when a message is given up
+after ATTEMPTS attempts, as failures."
+  (mapcar (lambda (s)
+            (let ((s (copy-recipient-status s)))
+              (setf (recipient-status-status s) :failed
+                    (recipient-status-message s)
+                    (format nil "Gave up after ~d attempts: ~a" attempts (recipient-status-message s)))
+              s))
+          statuses))
+
+(defun %record-attempt (queue item now delivered failed deferred)
+  "Record an attempt's outcome, under the lock. If the message has been
+queued too long, what is still deferred fails. Returns the statuses
+delivered, failed and deferred, for the callbacks."
+  (bt:with-lock-held ((%queue-lock queue))
+    (let ((attempts (incf (queued-message-attempts item))))
+      (when (>= (- now (queued-message-queued-at item)) (delivery-queue-give-up-after queue))
+        (setf failed (append failed (%give-up deferred attempts))
+              deferred '()))
+      (let ((statuses (append delivered failed deferred)))
+        (setf (queued-message-statuses item)
+              (append (remove-if (lambda (s) (member (recipient-status-recipient s) statuses
+                                                     :key #'recipient-status-recipient
+                                                     :test #'string-equal))
+                                 (queued-message-statuses item))
+                      statuses)
+              (queued-message-recipients item) (mapcar #'recipient-status-recipient deferred)
+              (queued-message-next-attempt item) (+ now (%retry-delay queue attempts))))
+      (unless deferred
+        (setf (%items queue) (remove item (%items queue))))
+      (values delivered failed deferred))))
+
 (defun %process-item (queue item now)
-  (let* ((statuses (apply #'deliver-raw-message (queued-message-octets item)
-                          :envelope-from (queued-message-envelope-from item)
-                          :recipients (queued-message-recipients item)
-                          :smtputf8 (queued-message-smtputf8 item)
-                          (delivery-queue-options queue)))
-         (expired (>= (- now (queued-message-queued-at item)) (delivery-queue-give-up-after queue))))
+  "Attempt ITEM and record the outcome. Returns the callbacks to make, as a
+list of (function statuses)."
+  (let ((statuses (apply #'deliver-raw-message (queued-message-octets item)
+                         :envelope-from (queued-message-envelope-from item)
+                         :recipients (queued-message-recipients item)
+                         :smtputf8 (queued-message-smtputf8 item)
+                         (delivery-queue-options queue))))
     (flet ((with-status (status)
              (remove status statuses :key #'recipient-status-status :test-not #'eq)))
-      (let ((delivered (with-status :delivered))
-            (failed (with-status :failed))
-            (deferred (with-status :deferred)))
-        (when expired
-          ;; Out of time: what is still deferred has failed.
-          (setf failed (append failed
-                               (mapcar (lambda (s)
-                                         (let ((s (copy-recipient-status s)))
-                                           (setf (recipient-status-status s) :failed
-                                                 (recipient-status-message s)
-                                                 (format nil "Gave up after ~d attempts: ~a"
-                                                         (1+ (queued-message-attempts item))
-                                                         (recipient-status-message s)))
-                                           s))
-                                       deferred))
-                deferred '()))
-        (bt:with-lock-held ((%queue-lock queue))
-          (incf (queued-message-attempts item))
-          (setf (queued-message-statuses item)
-                (append (remove-if (lambda (s) (member (recipient-status-recipient s) statuses
-                                                       :key #'recipient-status-recipient :test #'string-equal))
-                                   (queued-message-statuses item))
-                        delivered failed deferred)
-                (queued-message-recipients item) (mapcar #'recipient-status-recipient deferred)
-                (queued-message-next-attempt item)
-                (+ now (%retry-delay queue (queued-message-attempts item))))
-          (unless deferred
-            (setf (%items queue) (remove item (%items queue)))))
-        (%notify (%on-delivered queue) item delivered)
-        (%notify (%on-failed queue) item failed)
-        (%notify (%on-deferred queue) item deferred)))))
+      (multiple-value-bind (delivered failed deferred)
+          (%record-attempt queue item now
+                           (with-status :delivered) (with-status :failed) (with-status :deferred))
+        (list (list (%on-delivered queue) delivered)
+              (list (%on-failed queue) failed)
+              (list (%on-deferred queue) deferred))))))
 
 (defun %attempt-failed (queue item now condition)
-  (let ((expired (>= (- now (queued-message-queued-at item)) (delivery-queue-give-up-after queue)))
-        (failed '()))
-    (bt:with-lock-held ((%queue-lock queue))
-      (incf (queued-message-attempts item))
-      (if expired
-          (let ((message (format nil "Gave up after ~d attempts: ~a"
-                                 (queued-message-attempts item) condition)))
-            (setf failed (mapcar (lambda (r) (%status r :failed :message message))
-                                 (queued-message-recipients item))
-                  (queued-message-statuses item)
-                  (append (remove-if (lambda (s) (member (recipient-status-recipient s)
-                                                         (queued-message-recipients item)
-                                                         :test #'string-equal))
-                                     (queued-message-statuses item))
-                          failed)
-                  (queued-message-recipients item) '()
-                  (%items queue) (remove item (%items queue))))
-          (setf (queued-message-next-attempt item)
-                (+ now (%retry-delay queue (queued-message-attempts item))))))
-    (%notify (%on-failed queue) item failed)))
+  "Record an attempt that failed with CONDITION, a local problem rather than
+a reply: every outstanding recipient is deferred. Returns the callbacks to
+make, as %PROCESS-ITEM does."
+  (let ((message (format nil "~a" condition)))
+    (multiple-value-bind (delivered failed deferred)
+        (%record-attempt queue item now '() '()
+                         (mapcar (lambda (r) (%status r :deferred :message message))
+                                 (queued-message-recipients item)))
+      (declare (ignore delivered))
+      (list (list (%on-failed queue) failed)
+            (list (%on-deferred queue) deferred)))))
 
 (defun run-delivery-queue (queue &key (now (get-universal-time)))
   "Attempt every message that is due. Returns the number attempted."
-  (let ((due (bt:with-lock-held ((%queue-lock queue))
-               (let ((due (remove-if (lambda (item) (> (queued-message-next-attempt item) now))
-                                     (%items queue))))
-                 ;; Claim them, so that a concurrent run does not try them too.
-                 (dolist (item due)
-                   (setf (queued-message-next-attempt item) most-positive-fixnum))
-                 due))))
-    (dolist (item due)
-      (handler-case (%process-item queue item now)
-        (error (e)
-          ;; A bug or a local problem: keep the message and try later,
-          ;; unless it has been queued too long.
-          (warn "Delivery of ~a failed: ~a" (queued-message-id item) e)
-          (%attempt-failed queue item now e))))
+  (let* ((claimed '())
+         (due (bt:with-lock-held ((%queue-lock queue))
+                (let ((due (remove-if (lambda (item) (> (queued-message-next-attempt item) now))
+                                      (%items queue))))
+                  ;; Claim them, so that a concurrent run does not try them too.
+                  (dolist (item due)
+                    (push (cons item (queued-message-next-attempt item)) claimed)
+                    (setf (queued-message-next-attempt item) most-positive-fixnum))
+                  due))))
+    (unwind-protect
+         (dolist (item due)
+           (let ((callbacks
+                   (handler-case (%process-item queue item now)
+                     ;; A bug or a local problem: keep the message and try
+                     ;; later, unless it has been queued too long.
+                     (error (e)
+                       (prog1 (%attempt-failed queue item now e)
+                         (warn "Delivery of ~a failed: ~a" (queued-message-id item) e))))))
+             (setf claimed (remove item claimed :key #'car))
+             (loop for (fn statuses) in callbacks
+                   do (%notify fn item statuses))))
+      ;; Unwound part way (a warning made an error, say): release the
+      ;; claims on the items not attempted, so that they are not stranded.
+      (when claimed
+        (bt:with-lock-held ((%queue-lock queue))
+          (loop for (item . next) in claimed
+                when (= (queued-message-next-attempt item) most-positive-fixnum)
+                  do (setf (queued-message-next-attempt item) next)))))
     (length due)))

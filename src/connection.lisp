@@ -360,8 +360,16 @@ backend; each backend translates its own TLS conditions."
                  (connection-esmtp-p connection) nil))
           (t (check-reply connection reply line '(2))))))
 
-(defun %starttls (connection)
-  (command connection "STARTTLS" :expect '(220))
+(defun %starttls (connection &key opportunistic)
+  "Upgrade CONNECTION to TLS. If OPPORTUNISTIC, a refusal (a reply other
+than 220, the session being otherwise unchanged) returns NIL and the
+session goes on in plaintext (RFC 3207 section 4.1 leaves this to the
+client)."
+  (let ((reply (command connection "STARTTLS" :expect nil)))
+    (unless (= (reply-code reply) 220)
+      (if (and opportunistic (/= (reply-code reply) 421))
+          (return-from %starttls nil)
+          (check-reply connection reply "STARTTLS" '(220)))))
   ;; Anything already received was sent before the handshake and would be
   ;; read as if it came over TLS (CVE-2011-0411 style injection).
   (when (with-io (connection "checking for injected data") (listen (%stream connection)))
@@ -460,7 +468,7 @@ instead."
            (when (and (member tls '(:starttls :opportunistic))
                       (not (connection-tls-p connection)))
              (cond ((nth-value 1 (connection-extension connection "STARTTLS"))
-                    (%starttls connection))
+                    (%starttls connection :opportunistic (eq tls :opportunistic)))
                    ((eq tls :starttls)
                     (error 'smtp-unsupported-extension
                            :name "STARTTLS"

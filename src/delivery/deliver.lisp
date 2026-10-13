@@ -73,7 +73,10 @@ when the lookup fails."
 
 (defun %addresses (host resolver)
   "HOST's addresses (IPv4 first), whether every answer received was secure,
-the CNAME-expanded name, and whether one of the two lookups failed."
+and the CNAME-expanded name. A failed lookup, when the other succeeds, does
+not make the host insecure: that would let anyone able to disrupt one
+query turn DANE off (RFC 7672 section 2.1.2). The addresses that were
+found are used, and DANE still applies to them."
   (let ((addresses '()) (secure t) (canonical nil) (errors 0))
     (dolist (type '(:a :aaaa))
       (handler-case
@@ -85,7 +88,7 @@ the CNAME-expanded name, and whether one of the two lookups failed."
         (dns-error () (incf errors))))
     (when (= errors 2)
       (error 'dns-error :name host :message (format nil "Cannot look up the address of ~a" host)))
-    (values addresses secure canonical (plusp errors))))
+    (values addresses secure canonical)))
 
 (defun %tlsa-lookup (base resolver port)
   "The secure TLSA records for BASE, :INSECURE, or :NONE. A failed lookup
@@ -107,17 +110,10 @@ a certificate verified for that address."
                      :security :opportunistic-tls :tls :opportunistic :tls-hostname nil))))
 
 (defun %plan-route (host domain mx-secure policy resolver &key dane require-tls (tlsa-port 25))
-  (multiple-value-bind (addresses secure canonical failed) (%addresses host resolver)
+  (multiple-value-bind (addresses secure canonical) (%addresses host resolver)
     (let ((route (%make-route :host host :addresses addresses)))
       (when (null addresses)
         (setf (route-reason route) (format nil "~a has no address" host))
-        (return-from %plan-route route))
-      ;; A failed lookup does not show that the host is unsigned (RFC 7672
-      ;; section 2.1.2); where DANE could apply, the host is skipped rather
-      ;; than sent mail without its TLSA records being checked.
-      (when (and failed dane mx-secure secure)
-        (setf (route-reason route)
-              (format nil "Cannot look up every address of ~a, so DANE cannot be checked" host))
         (return-from %plan-route route))
       ;; DANE: only when the MX and address answers are both validated.
       (when (and dane mx-secure secure)

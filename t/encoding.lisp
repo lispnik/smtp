@@ -246,3 +246,11 @@
                        (push (list source status expected got) failures))))))
     (is (= 6235 count))
     (is (null failures) "~d failures, first ~s" (length failures) (first failures))))
+
+(test base64-rejects-truncation-and-bad-padding
+  (dolist (bad '("Q" "QQ" "QUI" "Q===" "QUJD=" "QUJDRA=" "QUJDRA===" "QQ=" "QQ==="))
+    (signals smtp-error (base64-decode bad) "~s was accepted" bad))
+  (is (equalp (octets "A") (base64-decode "QQ==")))
+  (is (equalp (octets "AB") (base64-decode "QUI=")))
+  (is (equalp (octets "ABC") (base64-decode (format nil "QU~%JD"))))
+  (is (equalp #() (base64-decode ""))))

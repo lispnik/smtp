@@ -269,3 +269,26 @@ and OpenSSL's traditional DEK-Info encryption.")
       (smtp/dkim:load-dkim-private-key (substitute #\A #\B (substitute #\Q #\M pem :count 3 :from-end t)
                                                    :count 3 :from-end t)
                                        :password "dkim-test"))))
+
+(test dkim-header-names-are-validated
+  ;; A name with ";" would end the h= tag and inject others.
+  (dolist (bad '("x-a; l=0" "x b" "x:y" ""))
+    (signals smtp-error (smtp/dkim:make-dkim-signer :domain "example.com" :selector "s"
+                                                    :private-key (fixture "dkim-rsa-pkcs1.pem")
+                                                    :headers (list "from" bad)))
+    (signals smtp-error (smtp/dkim:make-dkim-signer :domain "example.com" :selector "s"
+                                                    :private-key (fixture "dkim-rsa-pkcs1.pem")
+                                                    :oversign (list bad)))))
+
+(test rsa-signing-is-blinded
+  ;; The private-key operation never sees the message representative
+  ;; itself, so its timing does not depend on attacker-chosen input alone.
+  (let ((signer (smtp/dkim:make-dkim-signer :domain "example.com" :selector "s2026"
+                                            :private-key (fixture "dkim-rsa-pkcs1.pem")))
+        (bases '()))
+    (sb-int:encapsulate 'ironclad:expt-mod 'record
+                        (lambda (f n e m) (push n bases) (funcall f n e m)))
+    (unwind-protect
+         (is (equalp (sign-test-message signer) (sign-test-message signer)))
+      (sb-int:unencapsulate 'ironclad:expt-mod 'record))
+    (is (= (length bases) (length (remove-duplicates bases))))))

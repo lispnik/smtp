@@ -178,7 +178,8 @@ cid:CONTENT-ID (generated if not given)."
 (defparameter +reserved-headers+
   '("Date" "From" "Sender" "To" "Cc" "Bcc" "Reply-To" "Subject" "Message-ID"
     "In-Reply-To" "References" "MIME-Version" "Content-Type"
-    "Content-Transfer-Encoding" "Content-Disposition" "Content-ID")
+    "Content-Transfer-Encoding" "Content-Disposition" "Content-ID"
+    "List-Unsubscribe" "List-Unsubscribe-Post")
   "Headers the library generates; set them with MAKE-MESSAGE's keywords.")
 
 (defun %check-header-name (name)
@@ -207,7 +208,17 @@ cid:CONTENT-ID (generated if not given)."
          (at (position #\@ inner)))
     (unless (and at (plusp at) (< at (1- (length inner))))
       (error 'invalid-header :name what :message (format nil "invalid message id ~s" id)))
-    (%check-id (remove #\@ inner :count 1 :start at) what)
+    (let ((left (subseq inner 0 at))
+          (right (subseq inner (1+ at))))
+      (%check-id left what)
+      ;; The right side may be a domain literal (RFC 5322 no-fold-literal),
+      ;; as generated for a sender at an address literal.
+      (if (and (> (length right) 1) (char= (char right 0) #\[))
+          (unless (and (char= (char right (1- (length right))) #\])
+                       (every (lambda (c) (and (< 32 (char-code c) 127) (not (find c "[]\\"))))
+                              (subseq right 1 (1- (length right)))))
+            (error 'invalid-header :name what :message (format nil "invalid message id ~s" id)))
+          (%check-id right what)))
     (format nil "<~a>" inner)))
 
 (defun %msg-id-list (designator what)

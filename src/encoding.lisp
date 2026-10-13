@@ -50,23 +50,32 @@ LINE-LENGTH, if given, inserts CRLF line breaks."
 
 (defun base64-decode (string)
   "Decode base64 STRING to octets. Whitespace is ignored; any other character
-outside the alphabet, or data after padding, is an error."
+outside the alphabet, data after padding, or a missing or excess padding
+character (as in truncated data) is an error."
   (let ((buffer (make-octet-buffer (length string)))
-        (bits 0) (nbits 0) (padding 0))
-    (loop for c across string
-          do (cond ((find c '(#\Space #\Tab #\Return #\Linefeed)))
-                   ((char= c #\=) (incf padding))
-                   (t
-                    (let ((v (position c +base64-alphabet+)))
-                      (unless (and v (zerop padding))
-                        (error 'smtp-protocol-error
-                               :message (format nil "Invalid base64 data ~s" string)))
-                      (setf bits (logior (ash bits 6) v))
-                      (incf nbits 6)
-                      (when (>= nbits 8)
-                        (decf nbits 8)
-                        (buffer-push (ldb (byte 8 nbits) bits) buffer)
-                        (setf bits (ldb (byte nbits 0) bits)))))))
+        (bits 0) (nbits 0) (padding 0) (sextets 0))
+    (flet ((invalid ()
+             (error 'smtp-protocol-error
+                    :message (format nil "Invalid base64 data ~s" string))))
+      (loop for c across string
+            do (cond ((find c '(#\Space #\Tab #\Return #\Linefeed)))
+                     ((char= c #\=) (incf padding))
+                     (t
+                      (let ((v (position c +base64-alphabet+)))
+                        (unless (and v (zerop padding))
+                          (invalid))
+                        (incf sextets)
+                        (setf bits (logior (ash bits 6) v))
+                        (incf nbits 6)
+                        (when (>= nbits 8)
+                          (decf nbits 8)
+                          (buffer-push (ldb (byte 8 nbits) bits) buffer)
+                          (setf bits (ldb (byte nbits 0) bits)))))))
+      ;; Whole quanta of four, with exactly the padding the data needs.
+      (unless (and (zerop (mod (+ sextets padding) 4))
+                   (= padding (mod (- 4 (mod sextets 4)) 4))
+                   (/= (mod sextets 4) 1))
+        (invalid)))
     (buffer-octets buffer)))
 
 (defun base64-body-to-buffer (octets buffer)

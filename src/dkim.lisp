@@ -369,6 +369,11 @@ HEADERS are the header names signed when present; OVERSIGN names those
 protected against being added. CANONICALIZATION is (header body), each
 :RELAXED or :SIMPLE. EXPIRATION, in seconds, sets x=. IDENTITY sets i=."
   (%check-tag-value selector "selector")
+  (dolist (name (append headers oversign))
+    ;; A header field name (RFC 5322 ftext) that cannot end the h= tag.
+    (unless (and (stringp name) (plusp (length name))
+                 (every (lambda (c) (and (< 32 (char-code c) 127) (not (find c ":;")))) name))
+      (error 'smtp:smtp-error :message (format nil "Invalid header name to sign ~s" name))))
   (let ((ascii-domain (smtp:domain-to-ascii domain)))
     (when identity
       (unless (and (stringp identity)
@@ -506,8 +511,23 @@ of the body."
                           +sha256-digest-info+
                           digest))
          (d (getf (ironclad:destructure-private-key (%key signer)) :d))
-         (s (ironclad:expt-mod (ironclad:octets-to-integer (coerce em 'smtp::octets)) d n)))
+         (m (ironclad:octets-to-integer (coerce em 'smtp::octets)))
+         ;; Blinding: the private-key operation works on m*r^e, a value
+         ;; unrelated to the message, and r^-1 removes r afterwards.
+         (r (loop for r = (+ 2 (ironclad:strong-random (- n 3)))
+                  when (= 1 (gcd r n)) return r))
+         (blinded (mod (* m (ironclad:expt-mod r (%rsa-e signer) n)) n))
+         (s (mod (* (ironclad:expt-mod blinded d n) (%mod-inverse r n)) n)))
     (ironclad:integer-to-octets s :n-bits (* 8 k))))
+
+(defun %mod-inverse (a n)
+  "The inverse of A modulo N, which must be coprime."
+  (let ((r0 n) (r1 (mod a n)) (t0 0) (t1 1))
+    (loop until (zerop r1)
+          do (let ((q (floor r0 r1)))
+               (psetf r0 r1 r1 (- r0 (* q r1))
+                      t0 t1 t1 (- t0 (* q t1)))))
+    (mod t0 n)))
 
 (defun %select-headers (fields names)
   "The fields to sign for header names NAMES, each name taking the last

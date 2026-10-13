@@ -494,3 +494,38 @@ socket buffers, deadlock against a server that blocks writing them."
                                                     :recipients recipients)))))
           (close-connection c))))
     (is (<= largest 1000) "~d commands were sent before a reply was read" largest)))
+
+(defun refusing-starttls-server (session)
+  "A server that offers STARTTLS but answers it with 454."
+  (srv-send session "220 refusing.test ESMTP")
+  (loop for line = (srv-read-line session)
+        while line
+        do (let ((verb (%verb line)))
+             (cond ((string= verb "EHLO") (srv-send session "250-refusing.test" "250 STARTTLS"))
+                   ((string= verb "STARTTLS") (srv-send session "454 4.7.0 TLS not available"))
+                   ((string= verb "DATA")
+                    (srv-send session "354 go")
+                    (setf (session-messages session)
+                          (append (session-messages session) (list (list nil nil (srv-read-data session)))))
+                    (srv-send session "250 queued"))
+                   ((string= verb "QUIT") (srv-send session "221 bye") (return))
+                   (t (srv-send session "250 ok"))))))
+
+(test opportunistic-tls-continues-after-a-refused-starttls
+  (with-mock-server (port s #'refusing-starttls-server)
+    (with-connection (c "127.0.0.1" :port port :tls :opportunistic :local-name "client.test" :timeout 5)
+      (is (not (connection-tls-p c)))
+      (is (send-message c (simple-message))))
+    (is (= 1 (length (session-messages s)))))
+  ;; Required TLS still fails.
+  (with-mock-server (port s #'refusing-starttls-server)
+    (signals smtp-transient-error
+      (open-connection "127.0.0.1" :port port :tls :starttls :local-name "client.test" :timeout 5))))
+
+(test pipelining-batch-must-be-positive
+  (with-mock-server (port s (standard-server))
+    (let ((c (connect port)))
+      (unwind-protect
+           (let ((smtp::*pipelining-batch* 0))
+             (signals type-error (sb-ext:with-timeout 3 (send-message c (simple-message)))))
+        (close-connection c)))))
