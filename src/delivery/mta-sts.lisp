@@ -138,6 +138,28 @@ exactly one more label on the left."
                         (smtp::buffer-push octet body))))
       (smtp::utf8-string body))))
 
+(defun %read-http-response (stream host)
+  "The body of the policy response from HOST read from STREAM. Signals
+SMTP-ERROR unless it is a 200 response with a text/plain body."
+  (let* ((status-line (%read-http-line stream))
+         (status (let ((words (uiop:split-string status-line :separator " ")))
+                   (and (alexandria:starts-with-subseq "HTTP/1." status-line)
+                        (second words)
+                        (parse-integer (second words) :junk-allowed t))))
+         (headers (loop for line = (%read-http-line stream)
+                        for colon = (position #\: line)
+                        until (zerop (length line))
+                        when colon
+                          collect (cons (subseq line 0 colon)
+                                        (string-trim " " (subseq line (1+ colon)))))))
+    (unless (eql status 200)
+      (error 'smtp-error :message (format nil "MTA-STS policy fetch from ~a returned ~s"
+                                          host status-line)))
+    (let ((type (cdr (assoc "Content-Type" headers :test #'string-equal))))
+      (unless (and type (alexandria:starts-with-subseq "text/plain" (string-downcase type)))
+        (error 'smtp-error :message (format nil "MTA-STS policy from ~a is not text/plain" host))))
+    (%read-http-body stream headers)))
+
 (defun fetch-mta-sts-policy-text (domain &key (resolver (default-resolver)) ca-file
                                           (tls-backend *tls-backend*))
   "GET https://mta-sts.DOMAIN/.well-known/mta-sts.txt with the certificate
@@ -163,24 +185,7 @@ text/plain body is accepted, and bodies are limited to 64 KiB."
                                               #\Return #\Linefeed #\Return #\Linefeed))
                                      tls)
                      (force-output tls)
-                     (let* ((status-line (%read-http-line tls))
-                            (status (let ((words (uiop:split-string status-line :separator " ")))
-                                      (and (alexandria:starts-with-subseq "HTTP/1." status-line)
-                                           (second words)
-                                           (parse-integer (second words) :junk-allowed t))))
-                            (headers (loop for line = (%read-http-line tls)
-                                           for colon = (position #\: line)
-                                           until (zerop (length line))
-                                           when colon
-                                             collect (cons (subseq line 0 colon)
-                                                           (string-trim " " (subseq line (1+ colon)))))))
-                       (unless (eql status 200)
-                         (error 'smtp-error :message (format nil "MTA-STS policy fetch from ~a returned ~s"
-                                                             host status-line)))
-                       (let ((type (cdr (assoc "Content-Type" headers :test #'string-equal))))
-                         (unless (and type (alexandria:starts-with-subseq "text/plain" (string-downcase type)))
-                           (error 'smtp-error :message (format nil "MTA-STS policy from ~a is not text/plain" host))))
-                       (%read-http-body tls headers)))
+                     (%read-http-response tls host))
                 (ignore-errors (close tls)))))
       (when socket (ignore-errors (usocket:socket-close socket))))))
 

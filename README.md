@@ -438,7 +438,13 @@ installed.
   in an `smtp-error` within its timeouts;
 - 3,000 random messages, rendered and read back with Python's email package;
 - 200,000 corrupted DNS responses;
-- a delivery queue run from several threads at once.
+- a delivery queue run from several threads at once;
+- 100,000 corrupted MTA-STS policy responses and TXT records;
+- 300 randomized delivery-queue scenarios, checked against a model: each
+  recipient delivered at most once, and reported delivered or failed exactly
+  once;
+- 200,000 random addresses, each either rejected or formatted and read back
+  unchanged.
 
 Pick sections with `STRESS=pool,messages make stress`. Each run fuzzes with a new
 random seed, which it prints; `SEED=n make stress` replays that run.

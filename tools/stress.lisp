@@ -1,7 +1,9 @@
 ;;; Stress tests for the smtp client: throughput, pool concurrency, connection
 ;;; churn, 50 MB messages, a hostile server, message-builder fuzzing checked
-;;; with Python's email package, DNS response fuzzing and a concurrent delivery
-;;; queue. Not part of make test; run with make stress, or from the checkout:
+;;; with Python's email package, DNS response fuzzing, a concurrent delivery
+;;; queue, MTA-STS response fuzzing, the queue checked against a model and
+;;; address fuzzing. Not part of make test; run with make stress, or from the
+;;; checkout:
 ;;;   sbcl --dynamic-space-size 4096 --non-interactive --load tools/stress.lisp
 ;;; Sections can be chosen with STRESS=throughput,pool,... (default all).
 ;;; The fuzzing sections draw from a random seed printed at the start; SEED=n
@@ -41,7 +43,7 @@
 
 (defun section-p (name)
   (let ((only (uiop:getenv "STRESS")))
-    (or (null only) (search name only))))
+    (or (null only) (member name (uiop:split-string only :separator ",") :test #'string=))))
 
 (defun open-fds ()
   (length (directory "/dev/fd/*.*")))
@@ -412,6 +414,291 @@ print('python checked', 'bad', bad)
         (unless (and (= 300 (hash-table-count delivered)) (zerop dupes) (= 300 (server-message-count server)))
           (finding "queue: delivered ~d, dupes ~d, server ~d" (hash-table-count delivered) dupes
                    (server-message-count server)))))))
+
+;;; 9. MTA-STS responses and policies
+
+(defparameter *crlf* (coerce '(#\Return #\Linefeed) 'string))
+
+(defclass octet-input (sb-gray:fundamental-binary-input-stream)
+  ((octets :initarg :octets) (pos :initform 0)))
+(defmethod sb-gray:stream-read-byte ((s octet-input))
+  (with-slots (octets pos) s
+    (if (< pos (length octets)) (prog1 (aref octets pos) (incf pos)) :eof)))
+(defmethod stream-element-type ((s octet-input)) '(unsigned-byte 8))
+
+(defun random-policy (rng)
+  "A valid policy's text, and the values PARSE-MTA-STS-POLICY should return."
+  (let* ((mode (random-elt rng '(:enforce :testing :none)))
+         (mx (loop repeat (if (eq mode :none) (random 3 rng) (1+ (random 3 rng)))
+                   collect (format nil "~:[~;*.~]mx~d.example.test" (zerop (random 3 rng)) (random 100 rng))))
+         (age (1+ (random 31557600 rng)))
+         (eol (random-elt rng (list *crlf* (string #\Newline))))
+         (lines (append (list "version: STSv1" (format nil "mode: ~(~a~)" mode))
+                        (mapcar (lambda (m) (format nil "mx: ~a" m)) mx)
+                        (list (format nil "max_age: ~d" age)))))
+    (values (format nil (concatenate 'string "~{~a" eol "~}") lines) (list mode mx age))))
+
+(defun random-http-response (rng body)
+  (let* ((octets (smtp::utf8-octets body))
+         (framing (random 3 rng))
+         (head (format nil "HTTP/1.1 200 OK~aContent-Type: text/plain; charset=utf-8~a~a"
+                       *crlf* *crlf*
+                       (case framing
+                         (0 (format nil "Content-Length: ~d~a" (length octets) *crlf*))
+                         (1 (format nil "Transfer-Encoding: chunked~a" *crlf*))
+                         (t ""))))
+         (out (smtp::make-octet-buffer 1024)))
+    (flet ((emit (x) (loop for o across (if (stringp x) (smtp::utf8-octets x) x)
+                           do (smtp::buffer-push o out))))
+      (emit head) (emit *crlf*)
+      (if (= framing 1)
+          (loop with start = 0
+                while (< start (length octets))
+                do (let ((end (min (length octets) (+ start 1 (random 40 rng)))))
+                     (emit (format nil "~x~:[~;;ext=1~]~a" (- end start) (zerop (random 4 rng)) *crlf*))
+                     (emit (subseq octets start end)) (emit *crlf*)
+                     (setf start end))
+                finally (emit (format nil "0~a~a" *crlf* *crlf*)))
+          (emit octets)))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun mutate-octets (rng v)
+  (let ((v (copy-seq v)))
+    (dotimes (k (1+ (random 4 rng)) v)
+      (let ((n (length v)))
+        (case (random 6 rng)
+          (0 (when (plusp n) (setf (aref v (random n rng)) (random 256 rng))))
+          (1 (when (plusp n) (setf v (subseq v 0 (random n rng)))))
+          (2 (let ((p (random (1+ n) rng)))
+               (setf v (concatenate '(vector (unsigned-byte 8)) (subseq v 0 p)
+                                    (smtp::utf8-octets (random-elt rng '("0" "-1" "ffffffffffffffffffff" ":" "\r\n" "\n"
+                                                                         "chunked" "99999999999" " ")))
+                                    (subseq v p)))))
+          (3 (when (plusp n) (let* ((a (random n rng)) (b (min n (+ a 1 (random 20 rng)))))
+                               (setf v (concatenate '(vector (unsigned-byte 8)) (subseq v 0 a) (subseq v b))))))
+          (4 (when (plusp n) (let* ((a (random n rng)) (b (min n (+ a 1 (random 20 rng)))))
+                               (setf v (concatenate '(vector (unsigned-byte 8)) (subseq v 0 b) (subseq v a))))))
+          (5 (when (plusp n) (setf (aref v (random n rng)) (random-elt rng (list 10 13 0 58 32 48))))))))))
+
+(defun check-policy (where text expected)
+  (multiple-value-bind (mode mx age) (smtp/delivery:parse-mta-sts-policy text)
+    (cond (expected
+           (unless (equal (list mode mx age) expected)
+             (finding "~a: a valid policy parsed as ~s, not ~s" where (list mode mx age) expected)))
+          (mode
+           (unless (and (member mode '(:enforce :testing :none)) (integerp age) (<= 0 age 31557600)
+                        (every #'stringp mx) (or mx (eq mode :none))
+                        (every (lambda (m) (and (string= m (string-downcase m))
+                                                (not (alexandria:ends-with-subseq "." m))))
+                               mx))
+             (finding "~a: policy parsed to ~s" where (list mode mx age)))))
+    mode))
+
+(when (section-p "mta-sts")
+  (format t "~&== MTA-STS: 100000 corrupted policy responses and 100000 TXT records~%")
+  (let ((rng (sb-ext:seed-random-state (fuzz-seed 300000 0))) (outcomes (make-hash-table)))
+    (timed ("responses" 100000)
+      (dotimes (i 100000)
+        (multiple-value-bind (policy expected) (random-policy rng)
+          (let* ((clean (zerop (random 5 rng)))
+                 (response (random-http-response rng policy))
+                 (octets (if clean response (mutate-octets rng response))))
+            (handler-case
+                (sb-sys:with-deadline (:seconds 2)
+                  (let ((body (smtp/delivery::%read-http-response
+                               (make-instance 'octet-input :octets octets) "mta-sts.example.test")))
+                    (unless (stringp body) (finding "mta-sts ~d: body ~s" i body))
+                    (incf (gethash (if (check-policy (format nil "mta-sts ~d" i) body (and clean expected))
+                                       :policy :invalid)
+                                   outcomes 0))))
+              (smtp-error ()
+                (when clean (finding "mta-sts ~d: a valid response was refused" i))
+                (incf (gethash :smtp-error outcomes 0)))
+              (sb-sys:deadline-timeout () (finding "mta-sts ~d: reading hung" i))
+              (error (e) (incf (gethash :other outcomes 0))
+                (when (< (gethash :other outcomes 0) 4) (finding "mta-sts ~d: ~a: ~a" i (type-of e) e))))))))
+    (format t "~&    ~{~a=~d~^ ~}~%" (loop for k being the hash-keys of outcomes using (hash-value v) append (list k v)))
+    (clrhash outcomes)
+    (timed ("TXT records" 100000)
+      (dotimes (i 100000)
+        (let* ((id (random-text rng 40))
+               (good (format nil "v=STSv1; id=~a" id))
+               (records (loop repeat (random 3 rng)
+                              collect (let ((r (if (zerop (random 2 rng)) good (random-text rng 60))))
+                                        (if (zerop (random 3 rng))
+                                            (let ((v (copy-seq r)))
+                                              (when (plusp (length v))
+                                                (setf (char v (random (length v) rng))
+                                                      (random-elt rng (coerce ";= vS1" 'list))))
+                                              v)
+                                            r)))))
+          (handler-case
+              (let ((result (smtp/delivery::parse-mta-sts-txt records)))
+                (incf (gethash (if result :id :none) outcomes 0))
+                (when (and result (not (and (stringp result) (<= 1 (length result) 32)
+                                            (every (lambda (c) (and (< (char-code c) 128) (alphanumericp c)))
+                                                   result))))
+                  (finding "mta-sts txt ~d: id ~s from ~s" i result records))
+                (when (and (equal records (list good)) (<= 1 (length id) 32)
+                           (every (lambda (c) (and (< (char-code c) 128) (alphanumericp c))) id)
+                           (not (equal result id)))
+                  (finding "mta-sts txt ~d: ~s gave ~s" i records result)))
+            (error (e) (finding "mta-sts txt ~d: ~a: ~a" i (type-of e) e))))))
+    (format t "~&    ~{~a=~d~^ ~}~%" (loop for k being the hash-keys of outcomes using (hash-value v) append (list k v)))))
+
+;;; 10. The delivery queue against a model
+
+(defun queue-model-run (seed)
+  "One randomized queue scenario with a simulated DELIVER-RAW-MESSAGE.
+Returns a list of problems."
+  (let* ((rng (sb-ext:seed-random-state seed)) (lock (bt:make-lock)) (problems '())
+         (sent (make-hash-table :test 'equal))       ; recipient -> times delivered
+         (refused (make-hash-table :test 'equal))    ; recipient -> refused for good
+         (reported (make-hash-table :test 'equal))   ; recipient -> final statuses reported
+         (all '()) (give-up 20000) (threads (1+ (random 4 rng))))
+    (labels ((pick (n) (bt:with-lock-held (lock) (random n rng)))
+             (problem (fmt &rest args) (bt:with-lock-held (lock) (push (apply #'format nil fmt args) problems)))
+             (report (statuses kind)
+               (bt:with-lock-held (lock)
+                 (dolist (st statuses) (push kind (gethash (smtp/delivery:recipient-status-recipient st) reported))))
+               (when (zerop (pick 10)) (error "callback failed")))
+             (deliver (octets &key recipients &allow-other-keys)
+               (declare (ignore octets))
+               (when (zerop (pick 8)) (error "local problem"))
+               (loop for r in recipients
+                     collect (let ((outcome (case (pick 7) ((0 1 2) :delivered) ((3 4) :deferred) (t :failed))))
+                               (bt:with-lock-held (lock)
+                                 (case outcome
+                                   (:delivered (incf (gethash r sent 0)))
+                                   (:failed (setf (gethash r refused) t))))
+                               (smtp/delivery::%status r outcome :message "simulated")))))
+      (let ((queue (smtp/delivery:make-delivery-queue
+                    :retry-schedule '(60 600 3600) :give-up-after give-up
+                    :on-delivered (lambda (i s) (declare (ignore i)) (report s :delivered))
+                    :on-failed (lambda (i s) (declare (ignore i)) (report s :failed))
+                    :on-deferred (lambda (i s) (declare (ignore i s)) (when (zerop (pick 10)) (error "callback failed")))))
+            (real (fdefinition 'smtp/delivery:deliver-raw-message))
+            (now 0))
+        (setf (fdefinition 'smtp/delivery:deliver-raw-message) #'deliver)
+        (unwind-protect
+             (handler-bind ((warning #'muffle-warning))
+               (loop for step from 0
+                     do (when (< step 20)
+                          (dotimes (m (random 3 rng))
+                            (let ((rcpts (loop for j below (1+ (random 5 rng))
+                                               collect (format nil "s~dm~dr~d@d~d.test" step m j (random 3 rng)))))
+                              (setf all (append all rcpts))
+                              (smtp/delivery:enqueue-raw-message queue (smtp::utf8-octets (crlf "Subject: x" "" "x"))
+                                                                 :envelope-from "a@example.test" :recipients rcpts
+                                                                 :now now))))
+                        (mapc #'bt:join-thread
+                              (loop repeat threads
+                                    collect (let ((at now))
+                                              (bt:make-thread (lambda () (smtp/delivery:run-delivery-queue queue :now at))))))
+                        (incf now (random 3000 rng))
+                     until (or (and (>= step 20) (null (smtp/delivery:delivery-queue-messages queue)))
+                               (> now (* 3 give-up)))))
+          (setf (fdefinition 'smtp/delivery:deliver-raw-message) real))
+        (when (smtp/delivery:delivery-queue-messages queue)
+          (problem "~d messages still queued long after giving up" (length (smtp/delivery:delivery-queue-messages queue))))
+        (dolist (r all)
+          (let ((times (gethash r sent 0)) (kinds (gethash r reported)))
+            (when (> times 1) (problem "~a delivered ~d times" r times))
+            (unless (= 1 (length kinds)) (problem "~a reported ~s" r kinds))
+            (when (and (= times 1) (not (equal kinds '(:delivered)))) (problem "~a delivered but reported ~s" r kinds))
+            (when (and (zerop times) (member :delivered kinds)) (problem "~a reported delivered but was not" r))
+            (when (and (gethash r refused) (not (equal kinds '(:failed))))
+              (problem "~a refused but reported ~s" r kinds))))
+        problems))))
+
+(when (section-p "queue-model")
+  (format t "~&== Delivery queue model: 300 randomized scenarios~%")
+  (let ((n 300) (bad 0))
+    (timed ("scenarios" n)
+      (dotimes (i n)
+        (let ((problems (queue-model-run (fuzz-seed 400000 i))))
+          (when problems
+            (incf bad)
+            (when (<= bad 3)
+              (finding "queue model ~d: ~{~a~^; ~}" i (subseq problems 0 (min 5 (length problems)))))))))
+    (format t "~&    scenarios with problems: ~d~%" bad)))
+
+;;; 11. Addresses
+
+(defun random-address-string (rng)
+  "A string near the shape of a mailbox, often valid, often not."
+  (let* ((specials "\"\\<>@,;:()[]. ")
+         (local (case (random 4 rng)
+                  (0 (random-text rng 12))
+                  (1 (format nil "\"~a\"" (random-text rng 12)))
+                  (2 (format nil "~a.~a" (random-text rng 6) (random-text rng 6)))
+                  (t (random-elt rng '("bob" "a.b" "x+tag" "\"a b\"" "\"a\\\"b\"" "ünï" "o'brien")))))
+         (domain (case (random 5 rng)
+                   (0 (random-text rng 15))
+                   (1 (random-elt rng '("example.test" "bücher.example" "xn--bcher-kva.example" "EXAMPLE.Test."
+                                        "[192.0.2.1]" "[IPv6:2001:db8::1]" "[300.1.1.1]" "a" "a..b" "-a.test")))
+                   (t (format nil "~a.~a" (random-text rng 8) (random-elt rng '("test" "example" "中国"))))))
+         (name (case (random 4 rng)
+                 (0 nil)
+                 (1 (random-text rng 20))
+                 (2 (format nil "\"~a\"" (random-text rng 20)))
+                 (t (random-elt rng '("Bob" "Bob Smith" "Smith, Bob" "=?utf-8?q?x?=" "Zoë"))))))
+    (let ((s (if name (format nil "~a <~a@~a>" name local domain) (format nil "~a@~a" local domain))))
+      (dotimes (k (random 3 rng) s)
+        (let ((p (random (1+ (length s)) rng)))
+          (setf s (case (random 3 rng)
+                    (0 (concatenate 'string (subseq s 0 p) (string (char specials (random (length specials) rng)))
+                                    (subseq s p)))
+                    (1 (if (< p (length s)) (concatenate 'string (subseq s 0 p) (subseq s (1+ p))) s))
+                    (t (concatenate 'string (subseq s 0 p)
+                                    (string (random-elt rng (list #\Tab #\Return #\Newline (code-char 0)
+                                                                  (code-char #x2028) #\" #\\)))
+                                    (subseq s p))))))))))
+
+(defun check-mailbox (where m)
+  (let ((address (mailbox-address m)))
+    (when (find-if #'smtp::control-char-p address) (finding "~a: control character in ~s" where address))
+    (when (> (length (smtp::utf8-octets address)) 254) (finding "~a: ~s is too long" where address))
+    (dolist (utf8 '(nil t))
+      (let ((text (format-mailbox m :utf8 utf8)))
+        (when (find-if #'smtp::control-char-p text) (finding "~a: control character in ~s" where text))
+        (handler-case
+            (let ((again (parse-mailbox text)))
+              (unless (and (smtp::mailbox= m again) (string= address (mailbox-address again))
+                           ;; Names are compared unless encoded (RFC 2047), as
+                           ;; they are without UTF8 or when a word is too long.
+                           (or (search "=?UTF-8?" text)
+                               (equal (mailbox-display-name m) (mailbox-display-name again))))
+                (finding "~a: ~s formats as ~s, which parses as ~s" where m text again)))
+          (error (e) (finding "~a: ~s formats as ~s, which does not parse: ~a" where m text e)))))))
+
+(when (section-p "addresses")
+  (format t "~&== Addresses: 200000 random mailboxes and 20000 lists~%")
+  (let ((rng (sb-ext:seed-random-state (fuzz-seed 500000 0))) (outcomes (make-hash-table)) (others 0))
+    (flet ((other (where e)
+             (when (< (incf others) 6) (finding "~a: ~a: ~a" where (type-of e) e))))
+      (timed ("mailboxes" 200000)
+        (dotimes (i 200000)
+          (let ((s (random-address-string rng)))
+            (handler-case
+                (let ((m (parse-mailbox s)))
+                  (incf (gethash :parsed outcomes 0))
+                  (check-mailbox (format nil "address ~d ~s" i s) m))
+              (invalid-address () (incf (gethash :invalid outcomes 0)))
+              (error (e) (other (format nil "address ~d ~s" i s) e))))))
+      (format t "~&    ~{~a=~d~^ ~}~%" (loop for k being the hash-keys of outcomes using (hash-value v) append (list k v)))
+      (timed ("lists" 20000)
+        (dotimes (i 20000)
+          (let ((mailboxes (loop repeat (1+ (random 4 rng))
+                                 for m = (ignore-errors (parse-mailbox (random-address-string rng)))
+                                 when m collect m)))
+            (when mailboxes
+              (let ((text (format nil "~{~a~^, ~}" (mapcar (lambda (m) (format-mailbox m :utf8 t)) mailboxes))))
+                (handler-case
+                    (let ((again (parse-mailbox-list text)))
+                      (unless (and (= (length again) (length mailboxes)) (every #'smtp::mailbox= mailboxes again))
+                        (finding "list ~d: ~s parses as ~s" i text again)))
+                  (error (e) (finding "list ~d: ~s does not parse: ~a" i text e)))))))))))
 
 (mapc (lambda (dir) (uiop:delete-directory-tree dir :validate t)) *cleanup*)
 (format t "~&~%== ~d finding~:p~%~{  - ~a~%~}" (length *findings*) (reverse *findings*))
