@@ -246,16 +246,26 @@ those still :DEFERRED may be tried at another host."
                                      (%literal-route host require-tls)
                                      (%plan-route host domain mx-secure policy resolver
                                                   :dane dane :require-tls require-tls))
-                               (dns-error (e) (%make-route :host host :reason (princ-to-string e))))))
+                               ;; DNS-ERROR, or a local problem.
+                               (error (e) (%make-route :host host :reason (princ-to-string e))))))
                   (if (route-reason route)
                       (push (route-reason route) reasons)
                       (dolist (address (route-addresses route))
-                        (let* ((statuses (%attempt route address pending octets
-                                                   (list* :port (if (functionp port)
-                                                                    (funcall port host address)
-                                                                    port)
-                                                          connection-options)
-                                                   send-options))
+                        (let* ((statuses
+                                 (handler-case
+                                     (%attempt route address pending octets
+                                               (list* :port (if (functionp port)
+                                                                (funcall port host address)
+                                                                port)
+                                                      connection-options)
+                                               send-options)
+                                   ;; A local problem (a bug, or a failing :PORT
+                                   ;; function) must not lose what earlier hosts
+                                   ;; accepted: treat it as this host failing.
+                                   (error (e)
+                                     (mapcar (lambda (r) (%status r :deferred :host host
+                                                                             :message (princ-to-string e)))
+                                             pending))))
                                (deferred (remove :deferred statuses :key #'recipient-status-status
                                                                     :test-not #'eq)))
                           ;; A server's reply says more than a later failure to connect.
@@ -277,7 +287,9 @@ those still :DEFERRED may be tried at another host."
                                   (format nil "~{~a~^; ~}" (reverse reasons))
                                   (format nil "No mail server for ~a could be reached" domain))))
         (delivery-failed (e) (finish :failed (princ-to-string e)))
-        (dns-error (e) (finish :deferred (princ-to-string e)))))))
+        ;; DNS-ERROR, or a local problem: the domain's recipients are
+        ;; deferred, and those of other domains keep their statuses.
+        (error (e) (finish :deferred (princ-to-string e)))))))
 
 (defun deliver-raw-message (octets &key envelope-from recipients smtputf8
                                      (resolver (default-resolver)) (mta-sts t)

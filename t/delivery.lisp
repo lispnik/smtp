@@ -789,14 +789,16 @@
           (is (string= "mx1.example.test" (d:recipient-status-host bob))))))))
 
 (test queue-survives-warnings-as-errors
-  ;; An application that turns warnings into errors: the item that failed
-  ;; is still rescheduled, and the others claimed with it are released.
+  ;; An application that turns warnings into errors, here the warning that
+  ;; a callback failed: the item is still rescheduled, and the others
+  ;; claimed with it are released.
   (with-mock-dns (r (example-zone))
     (let* ((queue (d:make-delivery-queue :resolver r :local-name "client.test" :mta-sts nil
                                          :timeout 5 :connect-timeout 5 :retry-schedule '(60)
-                                         :port (lambda (host address)
-                                                 (declare (ignore host address))
-                                                 (error "no port configured"))))
+                                         :port #'refused
+                                         :on-deferred (lambda (item statuses)
+                                                        (declare (ignore item statuses))
+                                                        (error "logging failed"))))
            (a (d:enqueue-message queue (simple-message :to "bob@example.test") :now 0))
            (b (d:enqueue-message queue (simple-message :to "bob@example.test") :now 0)))
       (ignore-errors
@@ -894,3 +896,43 @@
       (d:run-delivery-queue new :now 7200)
       (is (equal '(:failed) (mapcar #'d:recipient-status-status failed)))
       (is (search "Gave up after 2 attempts" (d:recipient-status-message (first failed)))))))
+
+(test local-error-at-a-later-host-keeps-deliveries
+  ;; mx1 takes bob and defers carol; trying carol at mx2 fails locally.
+  ;; bob's delivery must still be reported, or a queue would send it again.
+  (with-mock-dns (r (example-zone))
+    (with-mock-server (p s (standard-server :defer-recipients '("carol@example.test")))
+      (let ((statuses (d:deliver-message (simple-message :to "bob@example.test" :cc "carol@example.test")
+                                         :resolver r :local-name "client.test" :mta-sts nil
+                                         :connect-timeout 20 :timeout 20
+                                         :port (lambda (host address)
+                                                 (declare (ignore address))
+                                                 (if (search "mx2" host) (error "boom") p)))))
+        (is (eq :delivered (d:recipient-status-status (status-of statuses "bob@example.test"))))
+        (let ((carol (status-of statuses "carol@example.test")))
+          (is (eq :deferred (d:recipient-status-status carol)))
+          (is (search "boom" (d:recipient-status-message carol))))))))
+
+(defclass failing-mta-sts-cache (d:mta-sts-cache) ())
+
+(defmethod d:mta-sts-cache-get ((cache failing-mta-sts-cache) domain)
+  (if (string= domain "other.test") (error "cache unavailable") (call-next-method)))
+
+(test local-error-for-a-later-domain-keeps-deliveries
+  ;; bob is delivered; looking up other.test's policy fails locally. The
+  ;; result must still say bob was delivered.
+  (let ((zone (example-zone)))
+    (zone-add zone "other.test" :a "127.0.0.1")
+    (with-mock-dns (r zone)
+      (with-mock-server (p s (standard-server))
+        (let ((statuses (d:deliver-message (simple-message :to "bob@example.test" :cc "carol@other.test")
+                                           :resolver r :local-name "client.test"
+                                           :mta-sts-cache (make-instance 'failing-mta-sts-cache)
+                                           :connect-timeout 20 :timeout 20
+                                           :port (lambda (host address)
+                                                   (declare (ignore host address))
+                                                   p))))
+          (is (eq :delivered (d:recipient-status-status (status-of statuses "bob@example.test"))))
+          (let ((carol (status-of statuses "carol@other.test")))
+            (is (eq :deferred (d:recipient-status-status carol)))
+            (is (search "cache unavailable" (d:recipient-status-message carol)))))))))
