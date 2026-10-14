@@ -126,6 +126,7 @@
    #:make-connection-pool
    #:close-connection-pool
    #:with-pooled-connection
+   #:retry-with-fresh-connection
    #:pool-send-message
    #:connection-pool-statistics
    #:smtp-pool-timeout

@@ -192,6 +192,19 @@ that point, so it cannot arrive twice. Failures after that are signalled as
 usual. A connection left broken or mid-transaction is closed rather than
 returned to the pool. `connection-pool-statistics` reports usage.
 
+Code sending inside `with-pooled-connection` gets the same retry from the
+restart `retry-with-fresh-connection`. It is offered only in that case (a
+reused connection, dead before any `MAIL FROM` was accepted on it), and it
+evaluates the body again on a new connection, so the body should be safe to
+repeat up to that point. The function of the same name invokes it when it is
+offered:
+
+```lisp
+(handler-bind ((smtp:smtp-error #'smtp:retry-with-fresh-connection))
+  (smtp:with-pooled-connection (c *pool*)
+    (smtp:send-raw-message c signed-octets :envelope-from from :recipients to)))
+```
+
 ### Building messages
 
 ```lisp

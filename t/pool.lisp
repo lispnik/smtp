@@ -288,6 +288,73 @@ a reply line."
         (is (equal '("bob@example.net") (delivery-result-accepted result))))
       (is (= 1 (stat pool :idle))))))
 
+;;; The restart, for code that sends inside WITH-POOLED-CONNECTION
+
+(defun send-raw (connection)
+  (send-raw-message connection (render-message (simple-message))
+                    :envelope-from "alice@example.com" :recipients "bob@example.net"))
+
+(defun drops-second-mail ()
+  "A server that drops its first connection when a second MAIL FROM arrives."
+  (scripted-server :on-mail (lambda (s index n)
+                              (declare (ignore s))
+                              (if (and (= index 0) (= n 1)) :close :ok))))
+
+(test raw-sends-retry-through-the-restart
+  (with-pool-server (port server (drops-second-mail))
+    (with-pool (pool port)
+      (with-pooled-connection (c pool) (send-raw c))
+      (let ((calls 0))
+        (handler-bind ((smtp-error #'retry-with-fresh-connection))
+          (with-pooled-connection (c pool)
+            (incf calls)
+            (send-raw c)))
+        (is (= 2 calls)))
+      (is (= 2 (stat pool :opened))))
+    (is (= 2 (server-message-count server)))))
+
+(test the-restart-is-only-offered-when-safe
+  (flet ((offered-p (thunk)
+           "Whether the error THUNK signals offers the restart."
+           (let ((offered :none))
+             (handler-case
+                 (handler-bind ((smtp-error
+                                  (lambda (e)
+                                    (when (eq offered :none)
+                                      (setf offered (and (find-restart 'retry-with-fresh-connection e) t))))))
+                   (funcall thunk))
+               (smtp-error () nil))
+             offered)))
+    ;; A reused connection dropped at MAIL FROM: offered, but not taken
+    ;; without a handler.
+    (with-pool-server (port server (drops-second-mail))
+      (with-pool (pool port)
+        (with-pooled-connection (c pool) (send-raw c))
+        (is (eq t (offered-p (lambda () (with-pooled-connection (c pool) (send-raw c))))))
+        (is (= 1 (stat pool :opened)))))
+    ;; A new connection: not offered.
+    (with-pool-server (port server (scripted-server :on-mail (constantly :close)))
+      (with-pool (pool port)
+        (is (null (offered-p (lambda () (with-pooled-connection (c pool) (send-raw c))))))))
+    ;; MAIL FROM was accepted on this connection earlier in the body: not
+    ;; offered, as repeating the body would send that message again.
+    (with-pool-server (port server (scripted-server
+                                    :on-mail (lambda (s index n)
+                                               (declare (ignore s))
+                                               (if (and (= index 0) (= n 2)) :close :ok))))
+      (with-pool (pool port)
+        (with-pooled-connection (c pool) (send-raw c))
+        (is (null (offered-p (lambda () (with-pooled-connection (c pool) (send-raw c) (send-raw c))))))))
+    ;; A permanent refusal on a reused connection: not offered.
+    (with-pool-server (port server (scripted-server
+                                    :on-mail (lambda (s index n)
+                                               (declare (ignore s index))
+                                               (if (= n 1) "550 5.7.1 Not allowed" :ok))))
+      (with-pool (pool port)
+        (with-pooled-connection (c pool) (send-raw c))
+        (is (null (offered-p (lambda () (with-pooled-connection (c pool) (send-raw c))))))))
+    (is (null (retry-with-fresh-connection)) "Without the restart it returns")))
+
 (test max-messages-per-connection-rotates
   (with-pool-server (port server (scripted-server))
     (with-pool (pool port :max-messages-per-connection 2)

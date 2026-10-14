@@ -12,10 +12,10 @@
 ;;; sent something unprompted, usually 421 before closing, or closed it) is
 ;;; discarded when checked out, at no cost. One idle for more than
 ;;; CHECK-AFTER seconds is first sent NOOP. Even so, a server can close a
-;;; connection just as it is reused, so POOL-SEND-MESSAGE retries once on a
-;;; fresh connection when a reused one fails before the server accepted MAIL
-;;; FROM; by then no message data has been sent, so a retry cannot deliver
-;;; the message twice.
+;;; connection just as it is reused, so WITH-POOLED-CONNECTION offers the
+;;; restart RETRY-WITH-FRESH-CONNECTION when a reused one fails before the
+;;; server accepted MAIL FROM; by then no message data has been sent, so a
+;;; retry cannot deliver the message twice. POOL-SEND-MESSAGE invokes it.
 ;;;
 ;;; All pool state is guarded by one lock, and no network I/O is done while
 ;;; holding it.
@@ -305,25 +305,61 @@ being returned to the pool."
            (funcall function connection entry))
       (%checkin pool entry))))
 
-(defun call-with-pooled-connection (pool function)
-  "Call FUNCTION with a connection from POOL, returning it to the pool
-afterwards."
-  (%call-with-entry pool (lambda (connection entry)
-                           (declare (ignore entry))
-                           (funcall function connection))))
-
-(defmacro with-pooled-connection ((var pool) &body body)
-  "Evaluate BODY with VAR bound to a connection from POOL, which is returned
-to the pool afterwards, or closed if BODY left it unusable or in the middle
-of a transaction. BODY must not keep the connection or give it to another
-thread."
-  `(call-with-pooled-connection ,pool (lambda (,var) (declare (ignorable ,var)) ,@body)))
-
 (defun %stale-error-p (condition)
   (or (typep condition 'smtp-connection-error)
       (and (typep condition 'smtp-reply-error)
            (smtp-error-reply condition)
            (= 421 (reply-code (smtp-error-reply condition))))))
+
+(defun call-with-pooled-connection (pool function)
+  "Call FUNCTION with a connection from POOL, returning it to the pool
+afterwards. If FUNCTION fails because a reused connection turned out to be
+dead (the server closed it or replied 421) before the server accepted MAIL
+FROM on it, the restart RETRY-WITH-FRESH-CONNECTION is offered: it discards
+the connection and calls FUNCTION once more with a new one."
+  (let ((fresh nil))
+    (loop
+      (block attempt
+        (return-from call-with-pooled-connection
+          (%call-with-entry
+           pool
+           (lambda (connection entry)
+             (let* ((mail-accepted nil)
+                    (outer *mail-accepted-hook*)
+                    (*mail-accepted-hook*
+                      (lambda (c)
+                        (when (eq c connection) (setf mail-accepted t))
+                        (when outer (funcall outer c)))))
+               (restart-case (funcall function connection)
+                 (retry-with-fresh-connection ()
+                   :report "Discard the dead connection and try again on a new one."
+                   :test (lambda (condition)
+                           (and condition
+                                (%pooled-reused entry)
+                                (not mail-accepted)
+                                (%stale-error-p condition)))
+                   (setf (%pooled-discard entry) t)
+                   (return-from attempt)))))
+           :fresh fresh)))
+      (setf fresh t))))
+
+(defmacro with-pooled-connection ((var pool) &body body)
+  "Evaluate BODY with VAR bound to a connection from POOL, which is returned
+to the pool afterwards, or closed if BODY left it unusable or in the middle
+of a transaction. BODY must not keep the connection or give it to another
+thread. If the connection was reused and proves dead before any MAIL FROM is
+accepted, RETRY-WITH-FRESH-CONNECTION evaluates BODY again on a new one, so
+BODY should be safe to repeat up to that point; see
+CALL-WITH-POOLED-CONNECTION."
+  `(call-with-pooled-connection ,pool (lambda (,var) (declare (ignorable ,var)) ,@body)))
+
+(defun retry-with-fresh-connection (&optional condition)
+  "Invoke the RETRY-WITH-FRESH-CONNECTION restart for CONDITION, if one is
+offered, and otherwise return NIL. Use it as a handler around
+WITH-POOLED-CONNECTION, as CONTINUE is used:
+  (handler-bind ((smtp-error #'retry-with-fresh-connection)) ...)"
+  (let ((restart (find-restart 'retry-with-fresh-connection condition)))
+    (when restart (invoke-restart restart))))
 
 (defun pool-send-message (pool message &rest options)
   "Send MESSAGE over a connection from POOL, as SEND-MESSAGE does with
@@ -332,31 +368,9 @@ be dead (the server closed it or replied 421) before the server accepted
 MAIL FROM, the message is sent once more over a new connection; nothing has
 been delivered at that point, so it cannot arrive twice. Any other failure
 is signalled as by SEND-MESSAGE, with its restarts."
-  (flet ((attempt (fresh)
-           (block attempt
-             (%call-with-entry
-              pool
-              (lambda (connection entry)
-                (let* ((mail-accepted nil)
-                       (outer *mail-accepted-hook*)
-                       (*mail-accepted-hook*
-                         (lambda (c)
-                           (when (eq c connection) (setf mail-accepted t))
-                           (when outer (funcall outer c)))))
-                  (handler-bind ((smtp-error
-                                   (lambda (e)
-                                     (when (and (%pooled-reused entry)
-                                                (not fresh)
-                                                (not mail-accepted)
-                                                (%stale-error-p e))
-                                       (setf (%pooled-discard entry) t)
-                                       (return-from attempt (values nil t))))))
-                    (values (apply #'send-message connection message options) nil))))
-              :fresh fresh))))
-    (multiple-value-bind (result retry) (attempt nil)
-      (if retry
-          (values (attempt t))
-          result))))
+  (handler-bind ((smtp-error #'retry-with-fresh-connection))
+    (with-pooled-connection (connection pool)
+      (apply #'send-message connection message options))))
 
 (defun close-connection-pool (pool)
   "Close POOL's idle connections; those in use are closed when returned.
