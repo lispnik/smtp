@@ -1,9 +1,10 @@
 ;;; Stress tests for the smtp client: throughput, pool concurrency, connection
 ;;; churn, 50 MB messages, a hostile server, message-builder fuzzing checked
 ;;; with Python's email package, DNS response fuzzing, a concurrent delivery
-;;; queue, MTA-STS response fuzzing, the queue checked against a model and
-;;; address fuzzing. Not part of make test; run with make stress, or from the
-;;; checkout:
+;;; queue, MTA-STS response fuzzing, the queue checked against a model,
+;;; address fuzzing, IDNA compared with Python, DKIM signatures verified by
+;;; dkimpy, and decoder fuzzing. Not part of make test; run with make stress,
+;;; or from the checkout:
 ;;;   sbcl --dynamic-space-size 4096 --non-interactive --load tools/stress.lisp
 ;;; Sections can be chosen with STRESS=throughput,pool,... (default all).
 ;;; The fuzzing sections draw from a random seed printed at the start; SEED=n
@@ -40,6 +41,44 @@
 (defun fuzz-seed (base i)
   ;; Independent seeds per section and iteration, all derived from *seed*.
   (+ (* *seed* 10000000) base i))
+
+(defparameter *python* (or (uiop:getenv "PYTHON") "python3")
+  "The Python that checks results; PYTHON= picks another, such as a
+virtualenv's with the optional idna, dkimpy and pynacl packages.")
+
+(defun json-string (s)
+  (with-output-to-string (o)
+    (write-char #\" o)
+    (loop for c across s
+          do (case c
+               (#\" (write-string "\\\"" o))
+               (#\\ (write-string "\\\\" o))
+               (t (cond ((or (< (char-code c) 32) (<= #xd800 (char-code c) #xdfff))
+                         (format o "\\u~4,'0x" (char-code c)))
+                        ((> (char-code c) #xffff)
+                         (let ((v (- (char-code c) #x10000)))
+                           (format o "\\u~4,'0x\\u~4,'0x" (+ #xd800 (ash v -10)) (+ #xdc00 (logand v #x3ff)))))
+                        (t (write-char c o))))))
+    (write-char #\" o)))
+
+(defun run-python (script &rest args)
+  "Run SCRIPT with ARGS; its output, or NIL with a note if Python lacks a
+module it needs (it then exits with status 3)."
+  (multiple-value-bind (out err status)
+      (uiop:run-program (list* *python* "-I" "-c" script args)
+                        :output :string :error-output :string :ignore-error-status t)
+    (cond ((eql status 3) (format t "~&    skipped: ~a~%" (string-trim '(#\Newline) out)) nil)
+          ((zerop status) out)
+          (t (finding "python failed: ~a~a" out err) nil))))
+
+(defun scratch-directory (name)
+  "A new directory for NAME's files, removed at the end unless there are
+findings."
+  (let ((dir (uiop:ensure-directory-pathname
+              (format nil "/tmp/smtp-stress-~a-~d/" name (random 1000000 (make-random-state t))))))
+    (ensure-directories-exist dir)
+    (push dir *cleanup*)
+    dir))
 
 (defun section-p (name)
   (let ((only (uiop:getenv "STRESS")))
@@ -274,10 +313,8 @@
 
 (when (section-p "messages")
   (format t "~&== Message builder: 3000 random messages~%")
-  (let ((dir (uiop:ensure-directory-pathname (format nil "/tmp/smtp-stress-~d/" (random 1000000))))
+  (let ((dir (scratch-directory "messages"))
         (rejected 0) (n 3000) (expectations '()))
-    (ensure-directories-exist dir)
-    (push dir *cleanup*)
     (timed ("render" n)
       (dotimes (seed n)
         (let ((rng (sb-ext:seed-random-state (fuzz-seed 100000 seed))))
@@ -311,24 +348,12 @@
       (format out "[~{~a~^,~}]"
               (mapcar (lambda (e)
                         (destructuring-bind (seed subject files text) e
-                          (flet ((js (s) (with-output-to-string (o)
-                                           (write-char #\" o)
-                                           (loop for c across s
-                                                 do (case c
-                                                      (#\" (write-string "\\\"" o))
-                                                      (#\\ (write-string "\\\\" o))
-                                                      (t (if (< (char-code c) 32)
-                                                             (format o "\\u~4,'0x" (char-code c))
-                                                             (if (> (char-code c) #xffff)
-                                                                 (let ((v (- (char-code c) #x10000)))
-                                                                   (format o "\\u~4,'0x\\u~4,'0x" (+ #xd800 (ash v -10)) (+ #xdc00 (logand v #x3ff))))
-                                                                 (write-char c o))))))
-                                           (write-char #\" o))))
+                          (flet ((js (s) (json-string s)))
                             (format nil "[~d,~a,[~{~a~^,~}],~a]" seed (js subject) (mapcar #'js files)
                                     (if text (js text) "null")))))
                       expectations)))
     (let ((report (uiop:run-program
-                   (list "python3" "-I" "-c" "
+                   (list *python* "-I" "-c" "
 import email, json, sys, os
 from email import policy
 d = sys.argv[1]
@@ -340,8 +365,9 @@ for seed, subject, files, text in json.load(open(os.path.join(d, 'expect.json'),
     # Readers drop a header's leading and trailing whitespace.
     if str(m['Subject']) not in (subject, subject.strip(), ' '.join(subject.split())): problems.append(f'subject {m[\"Subject\"]!r} != {subject!r}')
     got = [p.get_filename() for p in m.walk() if p.get_content_disposition() == 'attachment']
-    # Python strips one pair of surrounding double quotes from filenames.
-    unq = lambda f: f[1:-1] if len(f) > 1 and f[0] == f[-1] == '\"' else f
+    # Python strips one pair of surrounding double quotes, or angle
+    # brackets, from filenames (email.utils.unquote).
+    unq = lambda f: f[1:-1] if len(f) > 1 and (f[0] == f[-1] == '\"' or (f[0], f[-1]) == ('<', '>')) else f
     if got != files and got != [unq(f) for f in files]: problems.append(f'files {got!r} != {files!r}')
     if text is not None:
         part = next((p for p in m.walk() if p.get_content_type() == 'text/plain'), None)
@@ -700,7 +726,304 @@ Returns a list of problems."
                         (finding "list ~d: ~s parses as ~s" i text again)))
                   (error (e) (finding "list ~d: ~s does not parse: ~a" i text e)))))))))))
 
-(mapc (lambda (dir) (uiop:delete-directory-tree dir :validate t)) *cleanup*)
+;;; 12. IDNA and Punycode, against Python
+
+(defun report-python (output)
+  "Print OUTPUT, making each FINDING line a finding."
+  (dolist (line (uiop:split-string (string-right-trim '(#\Newline) output) :separator '(#\Newline)))
+    (if (alexandria:starts-with-subseq "FINDING " line)
+        (finding "~a" (subseq line 8))
+        (format t "~&    ~a~%" line))))
+
+(defparameter *label-pools*
+  (list "abcdefghijklmnopqrstuvwxyz0123456789-"
+        "éüñßøåçàèìòùÉÜÑ"
+        "中文字日本語한국어ЖжΩλςσבשالعربيةไทย"
+        (coerce (mapcar #'code-char '(#x1F600 #x1F4E7 #x200D #x200C #x0301 #xFF21 #x3002 #x00AD #x2028 #x0041
+                                      #x5F #x2E #x30FB #x0660 #x06F0 #x05D0 #x0627 #x094D #x00B7 #x0375))
+                'string)))
+
+(defun random-label (rng)
+  (let ((pools (loop repeat (1+ (random 2 rng)) collect (random-elt rng *label-pools*))))
+    (coerce (loop repeat (1+ (random 15 rng))
+                  collect (let ((pool (random-elt rng pools))) (char pool (random (length pool) rng))))
+            'string)))
+
+(defun random-domain (rng)
+  (let ((labels (loop repeat (1+ (random 3 rng))
+                      collect (case (random 6 rng)
+                                (0 (format nil "xn--~a" (random-elt rng (list (random-label rng) "bcher-kva" "--" "a-" "zz9"))))
+                                (1 (string-upcase (random-label rng)))
+                                (t (random-label rng))))))
+    (format nil "~{~a~^.~}~:[~;.~]" labels (zerop (random 8 rng)))))
+
+(defun json-or-null (s) (if s (json-string s) "null"))
+
+(when (section-p "idna")
+  (format t "~&== IDNA: 30000 labels, 30000 Punycode strings and 30000 domains, against Python~%")
+  (let ((rng (sb-ext:seed-random-state (fuzz-seed 600000 0))) (dir (scratch-directory "idna"))
+        (labels '()) (garbage '()) (domains '()))
+    (flet ((ours (fn x)
+             (handler-case (funcall fn x)
+               (invalid-address () nil)
+               (error (e) (finding "idna: ~a ~s: ~a: ~a" fn x (type-of e) e) nil))))
+      (timed ("ours" 90000)
+        (dotimes (i 30000)
+          (let* ((label (random-label rng)) (encoded (ours #'smtp::punycode-encode label)))
+            (when encoded
+              (let ((back (ours #'smtp::punycode-decode encoded)))
+                (unless (equal back label) (finding "punycode: ~s encodes as ~s, which decodes as ~s" label encoded back)))
+              (push (list label encoded) labels))))
+        (dotimes (i 30000)
+          (let ((g (coerce (loop repeat (random 12 rng)
+                                 collect (char "abcxyzABZ0189-" (random 14 rng)))
+                           'string)))
+            (let ((decoded (ours #'smtp::punycode-decode g)))
+              (push (list g decoded) garbage)
+              ;; As an A-label, it must be valid or rejected cleanly.
+              (when (and decoded (plusp (length g)))
+                (ours #'domain-to-ascii (format nil "xn--~a.test" g))))))
+        (dotimes (i 30000)
+          (let* ((d (random-domain rng)) (ascii (ours #'domain-to-ascii d)))
+            (when ascii
+              (unless (and (every (lambda (c) (< (char-code c) 128)) ascii) (string= ascii (string-downcase ascii))
+                           (<= (length ascii) 253)
+                           (every (lambda (l) (<= 1 (length l) 63)) (uiop:split-string ascii :separator ".")))
+                (finding "idna: ~s gave ~s" d ascii))
+              (let ((again (ours #'domain-to-ascii ascii)))
+                (unless (equal again ascii) (finding "idna: ~s gave ~s, which gives ~s" d ascii again))))
+            (push (list d ascii) domains)))))
+    (with-open-file (out (merge-pathnames "cases.json" dir) :direction :output :external-format :utf-8)
+      (flet ((pairs (list) (format nil "[~{~a~^,~}]"
+                                   (mapcar (lambda (p) (format nil "[~a,~a]" (json-string (first p)) (json-or-null (second p))))
+                                           list))))
+        (format out "{\"labels\":~a,\"garbage\":~a,\"domains\":~a}" (pairs labels) (pairs garbage) (pairs domains))))
+    (let ((report (run-python "
+import json, os, sys
+cases = json.load(open(os.path.join(sys.argv[1], 'cases.json'), encoding='utf-8'))
+def cap(kind, counts, msg):
+    counts[kind] = counts.get(kind, 0) + 1
+    if counts[kind] <= 5: print(msg)
+counts = {}
+for label, ours in cases['labels']:
+    theirs = label.encode('punycode').decode('ascii')
+    if theirs != ours: cap('enc', counts, f'FINDING punycode {label!r}: ours {ours!r}, Python {theirs!r}')
+# JSON joins a lone high and low surrogate into one character; so must Python.
+join = lambda s: s.encode('utf-16-le', 'surrogatepass').decode('utf-16-le', 'surrogatepass')
+for g, ours in cases['garbage']:
+    try: theirs = join(g.encode('ascii').decode('punycode'))
+    except Exception: theirs = None
+    if ours is not None and theirs is not None and ours != theirs:
+        cap('dec', counts, f'FINDING punycode decode {g!r}: ours {ours!r}, Python {theirs!r}')
+    elif ours is None and theirs is not None: counts['dec-we-reject'] = counts.get('dec-we-reject', 0) + 1
+    elif ours is not None and theirs is None: counts['dec-they-reject'] = counts.get('dec-they-reject', 0) + 1
+try:
+    import idna
+except ImportError:
+    print('domains skipped: no idna module'); idna = None
+reasons = {}
+if idna:
+    for d, ours in cases['domains']:
+        try: theirs = idna.encode(d, uts46=True, std3_rules=True, transitional=False).decode('ascii').rstrip('.')
+        except Exception as e:
+            theirs = None
+            if ours is not None:
+                import re
+                m = re.search(r'U\\+[0-9A-F]+', str(e))
+                why = m.group(0) if m else str(e)[:40]
+                reasons[why] = reasons.get(why, 0) + 1
+        if ours is not None and theirs is not None and ours != theirs:
+            cap('dom', counts, f'FINDING domain {d!r}: ours {ours!r}, idna {theirs!r}')
+        elif ours is None and theirs is not None:
+            # UTS 46 applies the Bidi rule (RFC 5893) to every label of a domain
+            # with right-to-left characters; idna only to labels that have them.
+            import unicodedata
+            rtl = any(unicodedata.bidirectional(c) in ('R', 'AL', 'AN') for c in d)
+            import re
+            if rtl and any(l and unicodedata.bidirectional(l[0]) not in ('L', 'R', 'AL')
+                           for l in re.split('[.。．｡]', d)):
+                counts['dom-bidi'] = counts.get('dom-bidi', 0) + 1
+            else:
+                cap('dom-we-reject', counts, f'FINDING domain {d!r}: ours rejects, idna gives {theirs!r}')
+        elif ours is not None and theirs is None:
+            counts['dom-they-reject'] = counts.get('dom-they-reject', 0) + 1
+print('python compared', len(cases['labels']), len(cases['garbage']), len(cases['domains']), 'counts', counts)
+print('idna (IDNA2008) rejections of domains UTS 46 accepts:', sorted(reasons.items(), key=lambda kv: -kv[1]))
+" (namestring dir))))
+      (when report (report-python report)))))
+
+;;; 13. DKIM signatures verified by dkimpy
+
+(defun wsp-mutate (rng octets)
+  "OCTETS with the whitespace, folding and case variations canonicalization
+must cope with."
+  (let* ((text (map 'string #'code-char octets))
+         (split (search (format nil "~c~c~c~c" #\Return #\Newline #\Return #\Newline) text))
+         (head (subseq text 0 (+ split 2)))
+         (body (subseq text (+ split 4)))
+         (nl (format nil "~c~c" #\Return #\Newline)))
+    (dotimes (k (1+ (random 4 rng)))
+      (case (random 10 rng)
+        (0 (setf body (with-output-to-string (o)
+                        (dolist (line (uiop:split-string body :separator '(#\Newline)))
+                          (write-string (string-right-trim '(#\Return) line) o)
+                          (when (zerop (random 3 rng)) (write-string (random-elt rng '(" " "	" " 	 ")) o))
+                          (write-string nl o)))
+                 body (subseq body 0 (max 0 (- (length body) 2)))))
+        (1 (setf body (concatenate 'string body (random-elt rng (list nl (concatenate 'string nl nl) (format nil " ~a~a" nl nl))))))
+        (2 (setf body ""))
+        (3 (when (alexandria:ends-with-subseq nl body) (setf body (subseq body 0 (- (length body) 2)))))
+        (4 (setf body (concatenate 'string (random-elt rng (list "  two  spaces  " (format nil "	tab~a" nl) (format nil " ~a" nl))) body)))
+        (5 (setf head (cl-ppcre-free-replace head "Subject:" (random-elt rng '("SUBJECT:" "subject:" "Subject:   ")))))
+        (6 (let ((p (search "Subject: " head)))
+             (when p (let ((sp (position #\Space head :start (+ p 9))))
+                       (when (and sp (< sp (or (search nl head :start2 p) 0)))
+                         (setf head (concatenate 'string (subseq head 0 sp) nl (random-elt rng '(" " "	")) (subseq head (1+ sp)))))))))
+        (7 (setf head (concatenate 'string head (random-elt rng (list (format nil "X-Extra: a  b ~a" nl)
+                                                                      (format nil "Subject: second~a" nl)
+                                                                      (format nil "X-Empty:~a" nl))))))
+        (8 (let ((p (search nl head)))
+             (setf head (concatenate 'string (subseq head 0 p) (random-elt rng '(" " "	" "  ")) (subseq head p)))))
+        ;; Bare line feeds, which are sent as CRLF.
+        (9 (let ((p (search nl body :start2 (random (1+ (length body)) rng))))
+             (when p (setf body (concatenate 'string (subseq body 0 p) (subseq body (1+ p)))))))))
+    (map '(vector (unsigned-byte 8)) #'char-code (concatenate 'string head nl body))))
+
+(defun cl-ppcre-free-replace (string old new)
+  (let ((p (search old string)))
+    (if p (concatenate 'string (subseq string 0 p) new (subseq string (+ p (length old)))) string)))
+
+(when (section-p "dkim")
+  (format t "~&== DKIM: 1000 random messages, each signed 8 ways, sent and verified by dkimpy~%")
+  (let* ((rng (sb-ext:seed-random-state (fuzz-seed 700000 0))) (dir (scratch-directory "dkim"))
+         (signers (loop for (key alg) in '(("dkim-rsa-pkcs8.pem" "r") ("dkim-ed25519.pem" "e"))
+                        append (loop for (hc bc) in '((:simple :simple) (:simple :relaxed) (:relaxed :simple) (:relaxed :relaxed))
+                                     collect (smtp/dkim:make-dkim-signer :domain "example.test"
+                                                               :selector (format nil "~a-~(~a~a~)" alg (char (string hc) 0) (char (string bc) 0))
+                                                               :private-key (fixture key)
+                                                               :canonicalization (list hc bc)))))
+         (signed 0))
+    (timed ("sign" 8000)
+      (dotimes (i 1000)
+        (handler-case
+            (let* ((octets (render-message (random-message rng)))
+                   (octets (if (zerop (random 2 rng)) octets (wsp-mutate rng octets))))
+              (dolist (signer signers)
+                (with-open-file (out (merge-pathnames (format nil "~d-~a.eml" i (smtp/dkim:dkim-signer-selector signer)) dir)
+                                     :direction :output :element-type '(unsigned-byte 8))
+                  ;; Verified as sent: line endings made CRLF, ending in CRLF.
+                  (write-sequence (smtp::prepare-data (sign-message-octets signer octets) :dot-stuff nil) out))
+                (incf signed)))
+          (mail-format-error ())
+          (error (e) (finding "dkim ~d: ~a: ~a" i (type-of e) e)))))
+    (with-open-file (out (merge-pathnames "keys.json" dir) :direction :output)
+      (format out "{~{~a~^,~}}" (mapcar (lambda (s) (format nil "~a:~a" (json-string (smtp/dkim:dkim-signer-selector s))
+                                                            (json-string (smtp/dkim:dkim-dns-record s))))
+                                        signers)))
+    (let ((report (run-python "
+import json, os, sys
+try:
+    import dkim, nacl
+except ImportError as e:
+    print(f'no {e.name} module (pip install dkimpy pynacl)'); sys.exit(3)
+d = sys.argv[1]
+keys = json.load(open(os.path.join(d, 'keys.json')))
+def dns(name, timeout=5):
+    return keys[name.decode().split('.')[0]].encode()
+bad = 0
+files = sorted(f for f in os.listdir(d) if f.endswith('.eml'))
+for f in files:
+    data = open(os.path.join(d, f), 'rb').read()
+    try: ok = dkim.verify(data, dnsfunc=dns)
+    except Exception as e: ok = False
+    if not ok:
+        bad += 1
+        if bad <= 8: print(f'FINDING dkim {f}: dkimpy does not verify it')
+print('dkimpy verified', len(files) - bad, 'of', len(files))
+" (namestring dir))))
+      (when report (report-python report)))
+    (format t "~&    signed ~d~%" signed)))
+
+;;; 14. Decoders on arbitrary input
+
+(when (section-p "decoders")
+  (format t "~&== Decoders: base64, quoted-printable and reply lines~%")
+  (let ((rng (sb-ext:seed-random-state (fuzz-seed 800000 0))) (dir (scratch-directory "decoders"))
+        (b64 '()) (outcomes (make-hash-table :test 'equal)))
+    (flet ((tally (k) (incf (gethash k outcomes 0)))
+           (octets (n) (let ((v (make-array n :element-type '(unsigned-byte 8))))
+                         (dotimes (i n v) (setf (aref v i) (random 256 rng))))))
+      (timed ("base64" 100000)
+        (dotimes (i 100000)
+          (let ((s (base64-encode (octets (random 60 rng)) :line-length (random-elt rng '(nil 76 4)))))
+            (dotimes (k (random 3 rng))
+              (let ((p (random (1+ (length s)) rng)))
+                (setf s (case (random 4 rng)
+                          (0 (concatenate 'string (subseq s 0 p) (string (random-elt rng (coerce "=A/+ 	-_!é" 'list))) (subseq s p)))
+                          (1 (if (< p (length s)) (concatenate 'string (subseq s 0 p) (subseq s (1+ p))) s))
+                          (2 (subseq s 0 p))
+                          (t (concatenate 'string (subseq s 0 p) (string #\Return) (string #\Newline) (subseq s p)))))))
+            (handler-case
+                (let ((v (base64-decode s)))
+                  (tally "base64 decoded")
+                  (unless (equalp v (base64-decode (base64-encode v)))
+                    (finding "base64 ~s decodes inconsistently" s))
+                  (push (list s (base64-encode v)) b64))
+              (smtp-protocol-error () (tally "base64 rejected") (push (list s nil) b64))
+              (error (e) (finding "base64 ~s: ~a: ~a" s (type-of e) e))))))
+      (timed ("quoted-printable" 50000)
+        (dotimes (i 50000)
+          ;; Valid, garbled and random input: decoding never fails.
+          (let ((encoded (quoted-printable-encode (random-text rng 200))))
+            (handler-case (progn (quoted-printable-decode
+                                  (random-elt rng (list encoded (random-text rng 100)
+                                                        (cl-ppcre-free-replace encoded "=" (random-elt rng '("==" "=X" "=\n" "=\r" ""))))))
+                                 (tally "qp decoded"))
+              (error (e) (finding "quoted-printable: ~a: ~a" (type-of e) e))))))
+      (timed ("reply lines" 100000)
+        (dotimes (i 100000)
+          (let ((line (concatenate 'string
+                                   (random-elt rng '("250" "2" "25" "199" "250" "421" "554" "600" "2x0" "550" "" "354"))
+                                   (random-elt rng '("" " " "-" "x" "  " "--"))
+                                   (random-elt rng '("" "" "2.1.0 " "5.7.1 " "4.0.0" "2.1 " "5.10.100 " "6.1.1 " "2..1 " "5.1.1x"))
+                                   (random-text rng 30))))
+            (handler-case
+                (multiple-value-bind (code more text) (smtp::parse-reply-line line)
+                  (tally "reply parsed")
+                  (unless (and (integerp code) (<= 200 code 559) (stringp text)
+                               (or (= (length line) 3)
+                                   (string= line (format nil "~d~:[ ~;-~]~a" code more text))))
+                    (finding "reply line ~s parsed as ~s ~s ~s" line code more text))
+                  (let ((status (smtp::parse-enhanced-status code text)))
+                    (when status
+                      (tally "enhanced status")
+                      (unless (and (alexandria:starts-with-subseq status text)
+                                   (= (count #\. status) 2)
+                                   (char= (char status 0) (char (princ-to-string code) 0)))
+                        (finding "reply ~s: enhanced status ~s" line status)))))
+              (smtp-protocol-error () (tally "reply rejected"))
+              (error (e) (finding "reply line ~s: ~a: ~a" line (type-of e) e)))))))
+    (format t "~&    ~{~a=~d~^ ~}~%" (loop for k being the hash-keys of outcomes using (hash-value v) append (list k v)))
+    (with-open-file (out (merge-pathnames "base64.json" dir) :direction :output :external-format :utf-8)
+      (format out "[~{~a~^,~}]" (mapcar (lambda (p) (format nil "[~a,~a]" (json-string (first p)) (json-or-null (second p)))) b64)))
+    (let ((report (run-python "
+import base64, binascii, json, os, sys
+bad = {}
+for s, ours in json.load(open(os.path.join(sys.argv[1], 'base64.json'), encoding='utf-8')):
+    t = ''.join(c for c in s if c not in ' \\t\\r\\n')
+    try: theirs = base64.b64encode(binascii.a2b_base64(t.encode('utf-8'), strict_mode=True)).decode()
+    except (binascii.Error, ValueError): theirs = None
+    if theirs != ours:
+        kind = 'we reject' if ours is None else 'they reject' if theirs is None else 'differ'
+        bad[kind] = bad.get(kind, 0) + 1
+        if bad[kind] <= 5: print(f'FINDING base64 {s!r}: ours {ours!r}, Python strict {theirs!r}')
+print('python base64 disagreements', bad)
+" (namestring dir))))
+      (when report (report-python report)))))
+
+(if *findings*
+    (format t "~&  Scratch files kept for inspection:~{ ~a~}~%" (mapcar #'namestring *cleanup*))
+    (mapc (lambda (dir) (uiop:delete-directory-tree dir :validate t)) *cleanup*))
 (format t "~&~%== ~d finding~:p~%~{  - ~a~%~}" (length *findings*) (reverse *findings*))
 (when *findings* (format t "~&  Replay with SEED=~d~%" *seed*))
 (uiop:quit (if *findings* 1 0))

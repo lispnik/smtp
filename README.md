@@ -444,10 +444,18 @@ installed.
   recipient delivered at most once, and reported delivered or failed exactly
   once;
 - 200,000 random addresses, each either rejected or formatted and read back
-  unchanged.
+  unchanged;
+- 30,000 Punycode labels and 30,000 domains compared with Python's punycode
+  codec and `idna` package;
+- 1,000 random messages signed eight ways (RSA and Ed25519, each
+  canonicalization) and verified by `dkimpy` as they would be sent;
+- base64, quoted-printable and reply-line decoding of random input.
 
-Pick sections with `STRESS=pool,messages make stress`. Each run fuzzes with a new
-random seed, which it prints; `SEED=n make stress` replays that run.
+Pick sections with `STRESS=pool,messages make stress`. Each run fuzzes with
+a new random seed, which it prints; `SEED=n make stress` replays that run.
+The domain and DKIM comparisons need Python's `idna`, `dkimpy` and `pynacl`
+packages and are skipped without them; `PYTHON=path/to/python` picks a
+Python that has them.
 
 `make integration` tests against real servers running in Docker:
 - [Mailpit](https://mailpit.axllent.org/), which keeps what it receives;
